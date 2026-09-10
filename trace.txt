@@ -1,0 +1,17 @@
+7809  socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+7809  setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+7809  bind(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("0.0.0.0")}, 16) = 0
+7809  listen(3, 10)                     = 0
+7809  --- SIGWINCH {si_signo=SIGWINCH, si_code=SI_KERNEL} ---
+7809  --- SIGWINCH {si_signo=SIGWINCH, si_code=SI_KERNEL} ---
+7809  --- SIGWINCH {si_signo=SIGWINCH, si_code=SI_KERNEL} ---
+7809  accept(3, NULL, NULL)             = 5
+7809  accept(3, NULL, NULL)             = -1 EAGAIN (资源暂时不可用)
+7809  recvfrom(5, "hello\n", 1023, 0, NULL, NULL) = 6
+7809  sendto(5, "hello\n", 6, 0, NULL, 0) = 6
+7809  recvfrom(5, 0x7fff2c76e240, 1023, 0, NULL, NULL) = -1 EAGAIN (资源暂时不可用)
+7809  recvfrom(5, "world\n", 1023, 0, NULL, NULL) = 6
+7809  sendto(5, "world\n", 6, 0, NULL, 0) = 6
+7809  recvfrom(5, 0x7fff2c76e240, 1023, 0, NULL, NULL) = -1 EAGAIN (资源暂时不可用)
+7809  --- SIGINT {si_signo=SIGINT, si_code=SI_KERNEL} ---
+7809  +++ killed by SIGINT +++
