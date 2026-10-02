@@ -1,16 +1,19 @@
 # WebServer —— 基于 epoll + Reactor 的高并发 HTTP 服务器
 
-> 从零手写的轻量级 C++ HTTP 服务器，使用 epoll（ET 边缘触发）+ Reactor 架构，
-> 支持长连接、连接超时管理、404 处理与优雅关闭。**单线程压测 QPS 达 3.7 万。**
+> 从零手写的 C++ HTTP 服务器：epoll（ET 边缘触发）+ Reactor 架构，三个演进版本
+> （单线程 → 线程池 → 主从 Reactor），支持 keep-alive、粘包/半包处理、连接超时、优雅关闭。
+> **wrk 压测：单线程 5.0 万 QPS，主从 5.3 万 QPS。**
 
 ## 功能特性
 
 - **IO 多路复用**：epoll（ET 边缘触发）+ 非阻塞 IO
-- **Reactor 架构**：自研 `EventLoop` / `Poller` / `Channel` 三层框架
+- **三种演进版本**：单线程 → 线程池 → 主从 Reactor（一主多从，多核并行）
+- **Reactor 架构**：自研 `EventLoop` / `Poller` / `Channel` / `Buffer` 框架
 - **HTTP/1.1 支持**：GET 请求解析、keep-alive 长连接、404 处理
+- **粘包/半包处理**：每连接独立缓冲区，循环提取完整请求
 - **连接管理**：连接超时自动断开（timerfd 定时扫描）
 - **优雅关闭**：Ctrl+C 安全退出（eventfd 唤醒事件循环）
-- **性能**：单线程 36927 QPS，零失败，P99 延迟 7ms
+- **工程化**：CMake 多目标构建 + GTest 单元测试（6 用例）
 
 ## 架构
 
@@ -24,55 +27,75 @@
    └── Buffer（每个连接的收发缓冲区，解决 TCP 粘包/半包）
 ```
 
+主从 Reactor 版（`webserver_multithread.cpp`）：
+
+```
+主线程：accept 新连接 → 轮询分发给 4 个从 Reactor
+4 个从线程：各自一个 epoll，独立处理分到的连接（各管各的连接表，无需加锁）
+```
+
 ## 技术栈
 
 - 语言：C++17
 - IO：epoll、ET 边缘触发、非阻塞 socket
-- 架构：Reactor（EventLoop / Poller / Channel / Buffer）
+- 架构：Reactor（EventLoop / Poller / Channel / Buffer）、主从 Reactor（多线程）
 - 定时：timerfd、eventfd
-- 工具：gdb、valgrind、strace、ab（压测）
+- 工具链：CMake、GDB、GTest、valgrind、strace、wrk / ab（压测）
 
 ## 压测数据
 
-环境：虚拟机（VirtualBox，单线程 Reactor）
+环境：VirtualBox 虚拟机（5 核），Release 构建，wrk 2 线程 / 100 连接
 
-| 场景 | 命令 | QPS | 备注 |
-|------|------|-----|------|
-| 长连接 | `ab -k -n 100000 -c 100` | **36927** | P50=2ms，P99=7ms，0 失败 |
-| 短连接 | `ab -n 100000 -c 100` | 7336 | 每请求含握手/挥手开销 |
+| 版本 | 工具 / 模式 | QPS |
+|------|------------|-----|
+| 单线程 | wrk / 长连接 | **50,106** |
+| 主从 Reactor | wrk / 长连接 | **52,802**（补 keep-alive 后） |
+| 单线程 | ab -k / 长连接 | 11,108（ab 自身先到瓶颈：单核 94%） |
+
+压测得到的结论（也是很好的排查教学）：
+- `ab` 是单进程工具，单核只推得动 ~1.1 万 QPS，会**先于服务器到顶**；换 `wrk` 后单线程版直接 5 万——**先确保压测工具不拖后腿**
+- 主从版最初只有短连接（每请求一次 TCP 握手），QPS 被锁在 1.4 万；补上 keep-alive 后到 5.3 万
+- 单机自测存在调度抖动，绝对值仅作参考，**同条件下的对照实验才有意义**
 
 ## 编译与运行
 
 ```bash
-# 编译
-g++ -std=c++17 -I include src/webserver.cpp -o webserver
+# 构建（Release）
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j
 
-# 运行
-./webserver
+# 运行（三个版本任选其一）
+./build-release/webserver                # 版本 1：单线程
+./build-release/webserver_thread         # 版本 2：线程池
+./build-release/webserver_multithread    # 版本 3：主从 Reactor
 
-# 测试
+# 接口测试
 curl http://127.0.0.1:8080/           # 首页
 curl http://127.0.0.1:8080/hello      # Hello
 curl http://127.0.0.1:8080/xyz        # 404
 
+# 单元测试
+ctest --test-dir build --output-on-failure
+
 # 压测
-ab -k -n 100000 -c 100 http://127.0.0.1:8080/
+wrk -t2 -c100 -d20s http://127.0.0.1:8080/
 ```
 
 ## 目录结构
 
 ```
+CMakeLists.txt              # 构建配置（4 个可执行文件 + 1 个测试目标）
 include/
-  Channel.hpp      # fd 的事件封装（回调分发）
-  Poller.hpp       # epoll 封装
-  EventLoop.hpp    # 事件循环
-  Buffer.hpp       # 收发缓冲区
-  Threadpool.hpp   # 线程池（早期版本）
-  simpleLogger.hpp # 异步日志
+  EventLoop.hpp / Poller.hpp / Channel.hpp   # Reactor 框架三件套
+  Buffer.hpp                                 # 收发缓冲区（含单元测试覆盖）
+  Threadpool.hpp / simpleLogger.hpp / Trace.hpp
 src/
-  webserver.cpp    # 主项目：HTTP WebServer
-  server.cpp       # epoll echo 服务器
-  lesson*.cpp      # 学习过程中的实验代码
+  webserver.cpp             # 版本 1：单线程 Reactor
+  webserver_thread.cpp      # 版本 2：线程池
+  webserver_multithread.cpp # 版本 3：主从 Reactor
+  chat_server.cpp           # 衍生项目：聊天中转服务器
+tests/
+  buffer_test.cpp / eof.cpp # Buffer 单元测试（GTest）
 ```
 
 ## 踩过的坑（面试重点）
@@ -87,10 +110,16 @@ src/
 
 5. **信号处理器限制**：信号处理器只能调用异步信号安全函数（如 `write`），不能调 `printf`/`malloc`。用 eventfd 唤醒事件循环，把复杂处理留给主循环。
 
+6. **主从版遗漏 keep-alive**：写死 `Connection: close`（每请求一次 TCP 握手），QPS 被锁在 1.4 万；补上连接复用后到 5.3 万。教训：**比较性能前先确认测试条件一致**。
+
+7. **粘包/半包处理**：只 `recv` 一次就当作完整请求 → 半包被错杀（直接断连）、粘包丢数据。解决：每连接一个 `Buffer`，循环提取完整请求；关闭连接时同步清空缓冲区表（fd 会被内核复用，漏清理会出现"幽灵数据"）。
+
+8. **accept 队列太小**：`listen(fd, 10)` 在短连接风暴下排队溢出，导致连接超时。改为 1024。
+
 ## TODO（进阶方向）
 
-- [ ] 主从 Reactor + 线程池（提升多核利用）
+- [ ] 主从版：连接超时清理（timerfd）
 - [ ] POST 请求与请求体解析
-- [ ] 静态文件服务
-- [ ] MySQL 连接池
-- [ ] 定时器改用时间轮/红黑树（支持海量连接）
+- [ ] 定时器改用时间轮 / 最小堆（支持海量连接）
+- [ ] 异步日志（双缓冲）
+- [ ] 基于现有 Reactor 框架的 RPC / KV 存储项目

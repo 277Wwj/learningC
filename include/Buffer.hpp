@@ -4,6 +4,7 @@
 #include <cstring>
 #include <sys/socket.h>
 #include <errno.h>
+using namespace std;
 class Buffer{
     public:
     Buffer(){}

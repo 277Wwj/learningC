@@ -9,11 +9,11 @@
 using namespace std;
 const int PORT=8080;
 const int SUB_NUM=4;//子Reactor数量（=工作线程数量）
-string make_response(const string &body){//构造回应
+string make_response(const string &body,bool keepAlive){//构造回应
     string resp;
     resp += "HTTP/1.1 200 OK\r\n";
     resp += "Content-Length: " + to_string(body.size()) + "\r\n";
-    resp += "Connection: close\r\n";
+    resp += keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     resp += "\r\n";
     resp += body;
     return resp;
@@ -47,12 +47,17 @@ void sub_reactor_loop(int epfd,int id){
                 stringstream ss(head.substr(0,lineEnd));//将第一行存进ss“水管”;
                 string method,path,version;
                 ss>>method>>path>>version;//根据“水管”里的空格进行分割然后分别赋值；
-                printf("[子Reactor %d] 处理 %s\n", id, path.c_str());
-                string resp=make_response("<h1>Hello</h1>");//这什么意思，作出回应报文吗；
+                //printf("[子Reactor %d] 处理 %s\n", id, path.c_str());
+                bool keepAlive = request.find("Connection: close") == string::npos;
+                string resp=make_response("<h1>Hello</h1>",keepAlive);//这什么意思，作出回应报文吗；
+                
                 send(fd,resp.data(),resp.size(),0);//发送数据，在发送这个fd的数据，，，但是发送给谁了我不知道
-                epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);//注册进epoll,意思就是将这个有数据的fd加入监控列表呗；
+                if(!keepAlive){
+                    epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);//注册进epoll,意思就是将这个有数据的fd加入监控列表呗；
 
-                close(fd);
+                    close(fd);
+                }
+                
 
                 
 
@@ -77,7 +82,7 @@ int main(){
     addr.sin_addr.s_addr=INADDR_ANY;
     addr.sin_port=htons(PORT);
     bind(listen_fd,(sockaddr*)&addr,sizeof(addr));
-    listen(listen_fd,10);
+    listen(listen_fd,1024);
     //创建通信监听，设置端口可复用，填IP/端口，开始监听，最多等待10个连接
     set_nonblocking(listen_fd);
     int main_epfd=epoll_create1(0);//创建一个epoll监视器；

@@ -1,0 +1,18 @@
+# 构建产物（可随时删除重建）
+build/
+build-release/
+cmake_practice/
+
+# 运行输出
+log.txt
+process_list.txt
+trace.txt
+threadpool_process.txt
+ab*.log
+
+# 编译中间产物
+*.o
+
+# 编辑器 / 工具
+.vscode/
+.claude/
