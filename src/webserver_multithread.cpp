@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include "Buffer.hpp"
 using namespace std;
 const int PORT=8080;
 const int SUB_NUM=4;//子Reactor数量（=工作线程数量）
@@ -25,47 +26,49 @@ void set_nonblocking (int fd){//给这个事件设置非阻塞模式
 }
 
 void sub_reactor_loop(int epfd,int id){
+
     epoll_event events[1024];//最多返回就绪事件1024
+    unordered_map<int,Buffer>buffers;
+    auto closeConn=[&](int fd){
+        epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);
+        close(fd);
+        buffers.erase(fd);
+    };
     while (true){
         int n=epoll_wait(epfd,events,1024,-1);//一直等待事件集合里的1024个事件的通知；
         //等待有事情发生
         for(int i=0; i<n;i++){
             int fd=events[i].data.fd;//获取就绪事件的文件描述符（为什么还要建立一个int呢直接获取不就行了）
-
-            char buf[4096];//接受数据的数组，
-            int r=recv(fd,buf,sizeof(buf),0);//将接受的数据给buf并且返回数据的长度；
-            if(r>0)//有数据
-            {
-                string request(buf,r);//将buf转为string并且长度为n；
-                size_t pos=request.find("\r\n\r\n");//分割请求报文的请求头和数据；
-                if(pos==string ::npos){//如果这个fd里没有数据就查下一个；
-                    close(fd);continue;
-
-                }
-                string head =request.substr(0,pos);
+            Buffer &buf=buffers[fd];
+            int r=buf.readFd(fd);
+            bool needClose=false;
+            while(true){
+                string all(buf.peek(),buf.readableBytes());
+                size_t pos =all.find("\r\n\r\n");
+                if(pos==string::npos)break;
+                string head=all.substr(0,pos);
                 size_t lineEnd=head.find("\r\n");
-                stringstream ss(head.substr(0,lineEnd));//将第一行存进ss“水管”;
+                stringstream ss(head.substr(0,lineEnd));
                 string method,path,version;
-                ss>>method>>path>>version;//根据“水管”里的空格进行分割然后分别赋值；
-                //printf("[子Reactor %d] 处理 %s\n", id, path.c_str());
-                bool keepAlive = request.find("Connection: close") == string::npos;
-                string resp=make_response("<h1>Hello</h1>",keepAlive);//这什么意思，作出回应报文吗；
-                
-                send(fd,resp.data(),resp.size(),0);//发送数据，在发送这个fd的数据，，，但是发送给谁了我不知道
+                ss>>method>>path>>version;
+                bool keepAlive =all.find("Connection: close")==string::npos;
+                string resp=make_response("<h1>Hello</h1>",keepAlive);
+                send(fd,resp.data(),resp.size(),0);
+                buf.retrieve(pos+4);
                 if(!keepAlive){
-                    epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);//注册进epoll,意思就是将这个有数据的fd加入监控列表呗；
-
-                    close(fd);
+                    needClose=true;
+                    break;
                 }
                 
-
-                
-
-
-            }else{
-                epoll_ctl(epfd,EPOLL_CTL_DEL,fd,nullptr);
-                close(fd);
             }
+            if(needClose){
+                    closeConn(fd);
+                    continue;
+                }
+                if(r==-1){
+                    closeConn(fd);
+
+                }
             
 
         }
