@@ -16,6 +16,22 @@ class Channel{
         Trace __t("Channel::enableReading");
         events_|=EPOLLIN;
     }
+    // 订阅"可写"事件：把 EPOLLOUT 位加进 events_（发送缓冲没发完时用它续发）
+    // 和 enableReading 一样：只改内存里的 events_，真正生效要 loop.updateChannel() 同步
+    void enableWriting(){
+        Trace __t("Channel::enableWriting");
+        events_|=EPOLLOUT;
+    }
+    // 取消"可写"订阅。⚠️ LT 模式下"可写"几乎一直成立，
+    // 发完了必须摘掉，否则事件循环会被"可写"空转刷爆
+    void disableWriting(){
+        Trace __t("Channel::disableWriting");
+        events_&=~EPOLLOUT;
+    }
+    // 当前是否订阅着"可写"（flush 里用来避免重复 epoll_ctl）
+    bool isWriting()const{
+        return (events_&EPOLLOUT)!=0;
+    }
     // 事件分发：内核说这个 fd 发生了哪些事件(revents)，就调用对应回调
     void handleEvent(int revents){
         Trace __t("Channel::handleEvent");

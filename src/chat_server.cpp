@@ -1,17 +1,22 @@
 // ===========================================================================
-// chat_server.cpp —— 聊天中转服务器（第 1 ~ 2 课）
+// chat_server.cpp —— 聊天中转服务器（第 1 ~ 6 课完成版）
 //
 // 【这个程序在干嘛】
 //   原来 11_lan_chat 用 UDP 广播找人，只能在同一个网段里用。
 //   现在所有客户端都连到这台服务器上，服务器帮它们互相转发消息。
 //   于是两个人只要有网、都能连到这台服务器，就能聊天 —— 不再要求同网段。
 //
-// 【本课完成】
+// 【已完成】
 //   第 1 课：监听 / accept / 连接生命周期管理（含"延迟回收"这个安全点）
 //   第 2 课：TCP 粘包·半包处理（按 [4B长度][4B魔数][4B类型][payload] 切帧）
-//   顺带：空闲连接超时回收 + Ctrl+C 优雅退出
+//   第 3 课：Login / Welcome / Users —— fd↔昵称 双索引 + 上下线名单广播
+//   第 4 课：Say → Chat 转发（群发 / 私聊，靠昵称查表 O(1) 路由）
+//   第 5 课：半写与 EPOLLOUT 续发（慢客户端不丢消息）+ 空闲连接超时回收
+//   第 6 课：Bye 主动退出 + 收尾
 //
-// 【下一课】第 3 课：Login / Welcome / Users 协议，让客户端能"上线"。
+//   逐函数讲解文档：C++后端/项目/聊天服务器-代码精读.md
+//
+// 【下一步】Qt 客户端接入 --server 模式（11_lan_chat 项目，路线图第 6 课）
 //
 // 【编译】用 VS Code 的 Ctrl+Shift+B 也行
 //   g++ -std=c++17 -pthread -I include src/chat_server.cpp -o src/chat_server
@@ -19,6 +24,7 @@
 //   ./src/chat_server
 // 【看事件循环调用链】默认关闭，想看时打开：
 //   TRACE=1 ./src/chat_server
+// 【冒烟测试】先跑起服务器，另开一个终端：python3 tests/chat_smoke_test.py
 // ===========================================================================
 
 #include <arpa/inet.h>
@@ -66,6 +72,7 @@ constexpr uint16_t kPort       = 12735;         // 服务器监听端口
 constexpr uint32_t kMagic      = 0x4C434831;    // 'L' 'C' 'H' '1'：用来认"这是我们的包"
 constexpr uint32_t kHeaderLen  = 12;            // 长度4 + 魔数4 + 类型4
 constexpr uint32_t kMaxPayload = 64 * 1024;     // 负载上限：防别人报个超大长度把内存打爆
+constexpr size_t   kMaxNickLen = 32;            // 昵称上限（字节；UTF-8 下一个汉字 3 字节）
 
 enum Type : uint32_t {
     Login   = 1,   // C→S  payload = 昵称(UTF-8)
@@ -74,7 +81,7 @@ enum Type : uint32_t {
     Say     = 4,   // C→S  payload = [1B 模式]["D"时: 目标昵称+'\0'][正文]
     Chat    = 5,   // S→C  payload = [1B 模式][发送者昵称+'\0'][正文]
     Bye     = 6,   // C→S  主动退出，payload 空
-    Error   = 7,   // S→C  错误文本，服务器随后断开连接
+    Error   = 7,   // S→C  错误文本（分两种：致命错误随后断开；可恢复错误只提示不断开）
 };
 
 const char* typeName(uint32_t t)
@@ -95,7 +102,9 @@ const char* typeName(uint32_t t)
 
 // 运行参数
 static constexpr int kHousekeepSec   = 5;    // 定时器周期：多久扫一遍空闲连接
-static constexpr int kIdleTimeoutSec = 120;  // 多久没收到任何数据就踢掉（第 5 课改成心跳）
+static constexpr int kIdleTimeoutSec = 120;  // 多久没收到任何数据就踢掉。
+                                             // 更"正统"的做法是协议层心跳（Ping/Pong），
+                                             // 等接 Qt 客户端时一起升级（见精读文档"下一步"）
 
 // ---------------------------------------------------------------------------
 // 二、小工具函数
@@ -166,6 +175,32 @@ std::string printable(const std::string& s, size_t maxLen = 80)
     return out;
 }
 
+// 昵称合法性检查：非空、不超长、不含控制字符。
+// 特别是 '\n' —— Users 名单用它当分隔符，昵称里混进换行整个名单就乱了。
+bool isValidNick(const std::string& nick)
+{
+    if (nick.empty() || nick.size() > proto::kMaxNickLen)
+        return false;
+    for (unsigned char c : nick) {
+        if (c < 0x20 || c == 0x7F)   // 控制字符（含 \n \r \0 和 ESC 之类）
+            return false;
+    }
+    return true;
+}
+
+// 组 Chat 帧的 payload：[1B 模式][发送者昵称 + '\0'][正文]
+// （'\0' 是分隔符：把前面变长的昵称和后面变长的正文切开）
+std::string buildChatPayload(char mode, const std::string& from, const std::string& body)
+{
+    std::string p;
+    p.reserve(2 + from.size() + body.size());
+    p.push_back(mode);
+    p += from;
+    p.push_back('\0');
+    p += body;
+    return p;
+}
+
 // ---- 信号处理 ----
 // 信号处理函数里只能调"异步信号安全"的函数：write/read 可以，printf/malloc 不行。
 // 所以这里只做一件事：往 eventfd 写 1 个字节，把事件循环叫醒，剩下的活儿交给主循环。
@@ -189,8 +224,8 @@ struct Connection {
     int fd = -1;
     std::unique_ptr<Channel> channel;
     Buffer in;                  // 收：可能收到半个包，先攒着
-    std::string out;            // 发：send 没发完的剩在这里（第 5 课用 EPOLLOUT 续发）
-    std::string nick;           // 登录后才有值（第 3 课）
+    std::string out;            // 发：send 没发完的剩在这里，等 EPOLLOUT 续发（第 5 课）
+    std::string nick;           // 登录后才有值（第 3 课）；同时也是"名单里的我"
     time_t lastActive = 0;      // 最后一次"有动静"的时间，用于踢空闲连接
     bool closing = false;       // 已在关闭流程中：所有回调看到它就立刻返回
 };
@@ -207,6 +242,7 @@ private:
     // ---- 事件回调 ----
     void onAccept();
     void onRead(Connection* conn);
+    void onWrite(Connection* conn);      // EPOLLOUT：内核可写了，续发剩下的
     void onIdleTick();
     void onWakeup();
 
@@ -216,8 +252,18 @@ private:
 
     // ---- 收发 ----
     void sendFrame(Connection* conn, uint32_t type, const std::string& payload);
+    void sendError(Connection* conn, const std::string& text, bool fatal);
     void flush(Connection* conn);
     void handleFrame(Connection* conn, uint32_t type, const std::string& payload);
+
+    // ---- 业务：登录 / 转发 / 名单（第 3、4 课）----
+    void handleLogin(Connection* conn, const std::string& payload);
+    void handleSay(Connection* conn, const std::string& payload);
+    void handleBye(Connection* conn);
+    std::vector<Connection*> loggedConns() const;   // 已登录连接快照（遍历时的安全做法）
+    std::string onlineNicks() const;                // Users 名单：全部在线昵称，'\n' 分隔
+    void broadcastUsers();                          // 名单变了 → 推给所有已登录的人
+    void broadcastChat(Connection* sender, const std::string& body);   // 群发转发
 
     EventLoop loop_;
     int listenFd_ = -1;
@@ -225,8 +271,10 @@ private:
     std::unique_ptr<Channel> timerCh_;
     std::unique_ptr<Channel> wakeupCh_;
 
-    std::unordered_map<int, std::unique_ptr<Connection>> conns_;        // fd → 连接
-    std::vector<std::unique_ptr<Connection>> pendingReap_;              // 待回收（安全点统一销毁）
+    std::unordered_map<int, std::unique_ptr<Connection>> conns_;   // fd → 连接（IO 世界的地址）
+    std::vector<std::unique_ptr<Connection>> pendingReap_;         // 待回收（安全点统一销毁）
+    std::unordered_map<std::string, int> nameIndex_;               // 昵称 → fd（业务世界的地址）
+    bool usersDirty_ = false;   // 名单变过吗？→ 安全点统一广播一次（防重入，见 reapPending）
 };
 
 // ---------------------------------------------------------------------------
@@ -302,7 +350,8 @@ void ChatServer::run()
     logLine("聊天中转服务器已启动，监听 0.0.0.0:%u", proto::kPort);
     logLine("测试：printf '\\x00\\x00\\x00\\x0a\\x4c\\x43\\x48\\x31\\x00\\x00\\x00\\x01hi' | nc 127.0.0.1 %u",
             proto::kPort);
-    logLine("（Ctrl+C 优雅退出；想看事件循环调用链用 TRACE=1 ./src/chat_server）");
+    logLine("（上面那串十六进制就是一帧 Login，登录昵称 \"hi\"；Ctrl+C 优雅退出）");
+    logLine("（完整功能冒烟测试：python3 tests/chat_smoke_test.py；看事件循环调用链：TRACE=1）");
 
     loop_.loop();
 
@@ -343,6 +392,7 @@ void ChatServer::onAccept()
         //   ② 每个回调开头检查 closing，已在关闭流程中就立刻返回
         Connection* raw = conn.get();
         conn->channel->setReadCallback ([this, raw] { onRead(raw); });
+        conn->channel->setWriteCallback([this, raw] { onWrite(raw); });   // EPOLLOUT：续发半写
         conn->channel->setErrorCallback([this, raw] { closeConn(raw, "EPOLLERR"); });
         conn->channel->setCloseCallback([this, raw] { closeConn(raw, "EPOLLHUP"); });
 
@@ -419,8 +469,10 @@ void ChatServer::onRead(Connection* conn)
 }
 
 // ---------------------------------------------------------------------------
-// 业务层：第 3 课开始在这里实现 Login / Say 的真正逻辑
-// 现在只打印出来，方便你用 nc 验证"拆包拆对了没有"
+// 业务层：一帧收全后，按"类型"分派 —— 这就是一个简单的状态机。
+//
+//   Connected（还没登录）→ 只接受 Login / Bye
+//   LoggedIn （已登录）  → 接受 Say / Bye（再来 Login 就提示忽略）
 // ---------------------------------------------------------------------------
 void ChatServer::handleFrame(Connection* conn, uint32_t type, const std::string& payload)
 {
@@ -428,9 +480,175 @@ void ChatServer::handleFrame(Connection* conn, uint32_t type, const std::string&
             conn->fd, proto::typeName(type), type,
             payload.size(), printable(payload).c_str());
 
-    // TODO 第 3 课：Login  → 记下昵称、回 Welcome、广播 Users
-    // TODO 第 4 课：Say    → 转成 Chat 转发给目标 / 广播给所有人
-    // TODO 第 6 课：Bye    → 主动断开
+    switch (type) {
+    case proto::Login: handleLogin(conn, payload); break;
+    case proto::Say:   handleSay(conn, payload);   break;
+    case proto::Bye:   handleBye(conn);            break;
+    default:
+        // Welcome / Users / Chat / Error 都是"服务器→客户端"的方向，
+        // 客户端不该发过来；收到就说明对方不是我们的客户端，或客户端写飞了
+        sendError(conn, "协议错误：不认识的消息类型", /*fatal=*/true);
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 【第 3 课】Login：客户端"报到"，服务器把昵称登记进两张表
+//
+// 四步：
+//   ① 校验昵称（非空、不超长、没有控制字符）
+//   ② 查重：名字被占了就 Error 提示，但**不断开** —— 让用户换个名字重试
+//   ③ 登记：conn->nick 记住名字；nameIndex_[名字] = fd（业务地址 → IO 地址）
+//   ④ 回 Welcome；名单广播不在这里做，交给安全点统一播（usersDirty_ 标记）
+// ---------------------------------------------------------------------------
+void ChatServer::handleLogin(Connection* conn, const std::string& payload)
+{
+    if (!conn->nick.empty()) {
+        // 已经登录过了：多半是客户端 bug —— 提示一下，但不断开
+        sendError(conn, "你已经登录过了（昵称=" + conn->nick + "）", /*fatal=*/false);
+        return;
+    }
+    if (!isValidNick(payload)) {
+        sendError(conn, "昵称不合法（1~32 字节，不能含换行等控制字符）", /*fatal=*/false);
+        return;
+    }
+    if (nameIndex_.count(payload) > 0) {
+        sendError(conn, "昵称「" + payload + "」已被占用，请换一个", /*fatal=*/false);
+        return;
+    }
+
+    conn->nick          = payload;
+    nameIndex_[payload] = conn->fd;      // 第二张表：昵称 → fd
+
+    logLine("[+] 用户上线：%s（fd=%d，当前在线 %zu 人）",
+            conn->nick.c_str(), conn->fd, nameIndex_.size());
+
+    sendFrame(conn, proto::Welcome, conn->nick);   // 只回给对方：登录成功
+    usersDirty_ = true;                            // 名单变了 → 安全点统一广播（含新人自己）
+}
+
+// ---------------------------------------------------------------------------
+// 【第 4 课】Say → Chat：转发
+//
+// payload 布局：[1B 模式]['D' 时: 目标昵称 + '\0'][正文]
+//   'B' 群发：转发给除发送者外的所有已登录用户
+//   'D' 私聊：拿目标昵称查 nameIndex_ 找到 fd，只发那一个人（O(1) 路由）
+// ---------------------------------------------------------------------------
+void ChatServer::handleSay(Connection* conn, const std::string& payload)
+{
+    if (conn->nick.empty()) {   // 状态机：先登录才能发言
+        sendError(conn, "请先 Login 再发言", /*fatal=*/true);
+        return;
+    }
+    if (payload.empty()) {
+        sendError(conn, "Say 格式错误：缺模式字节", /*fatal=*/true);
+        return;
+    }
+
+    const char mode = payload[0];
+
+    if (mode == 'B') {
+        const std::string body = payload.substr(1);
+        logLine("[>] %s 群发（正文 %zu 字节）", conn->nick.c_str(), body.size());
+        broadcastChat(conn, body);
+        return;
+    }
+
+    if (mode == 'D') {
+        // 'D' 后面是"目标昵称 + '\0'"：用 '\0' 把变长的昵称和变长的正文切开
+        const size_t sep = payload.find('\0', 1);
+        if (sep == std::string::npos) {
+            sendError(conn, "Say(D) 格式错误：目标昵称后缺 '\\0' 分隔符", /*fatal=*/true);
+            return;
+        }
+        const std::string target = payload.substr(1, sep - 1);
+        const std::string body   = payload.substr(sep + 1);
+
+        auto it = nameIndex_.find(target);
+        if (it == nameIndex_.end()) {
+            // 可恢复错误：对方不在线，只提示发送者，不踢人
+            sendError(conn, "对方不在线：" + target, /*fatal=*/false);
+            return;
+        }
+
+        auto cit = conns_.find(it->second);
+        if (cit == conns_.end() || cit->second->closing) {
+            // 理论上到不了（关闭时两张表是同步清理的）；防一手，真到了也当"不在线"
+            sendError(conn, "对方不在线：" + target, /*fatal=*/false);
+            return;
+        }
+
+        logLine("[>] %s 私聊 → %s（正文 %zu 字节）", conn->nick.c_str(), target.c_str(), body.size());
+        sendFrame(cit->second.get(), proto::Chat, buildChatPayload('D', conn->nick, body));
+        return;
+    }
+
+    sendError(conn, "Say 格式错误：模式必须是 'B' 或 'D'", /*fatal=*/true);
+}
+
+// 【第 6 课】Bye：客户端主动说"我要走了" → 走统一的关闭流程
+// （closeConn 里会做：清 nameIndex_、标记名单要广播、从 epoll 摘掉、延迟回收）
+void ChatServer::handleBye(Connection* conn)
+{
+    closeConn(conn, "客户端主动退出（Bye）");
+}
+
+// ---------------------------------------------------------------------------
+// 名单与广播
+// ---------------------------------------------------------------------------
+
+// 取一份"已登录连接"的快照（裸指针列表）。
+// 为什么先拷贝？sendFrame 失败会顺手 closeConn → erase conns_，
+// 边遍历 unordered_map 边改它是 UB。先快照、再操作，最稳。
+std::vector<Connection*> ChatServer::loggedConns() const
+{
+    std::vector<Connection*> v;
+    for (const auto& [fd, conn] : conns_) {
+        if (!conn->closing && !conn->nick.empty())
+            v.push_back(conn.get());
+    }
+    return v;
+}
+
+// 组一份在线名单：所有已登录昵称，'\n' 分隔。
+// 排个序再拼，让每次推送的顺序稳定（unordered_map 的遍历顺序不保证）。
+std::string ChatServer::onlineNicks() const
+{
+    std::vector<std::string> nicks;
+    for (const auto& [fd, conn] : conns_) {
+        if (!conn->closing && !conn->nick.empty())
+            nicks.push_back(conn->nick);
+    }
+    std::sort(nicks.begin(), nicks.end());
+
+    std::string list;
+    for (const std::string& n : nicks) {
+        if (!list.empty()) list += '\n';
+        list += n;
+    }
+    return list;
+}
+
+// 名单变了 → 推一份新的 Users 给所有已登录的人（含刚上线的新人自己）。
+// 本函数只在安全点（reapPending）被调用一次 —— 见 usersDirty_ 的说明。
+void ChatServer::broadcastUsers()
+{
+    const auto targets     = loggedConns();
+    const std::string list = onlineNicks();
+    logLine("[>] 广播 Users 名单（%zu 人在线）", targets.size());
+    for (Connection* c : targets)
+        sendFrame(c, proto::Users, list);
+}
+
+// 群发：把发送者的原话包成 Chat 帧，发给除他以外的所有在线用户。
+// （发送者自己不回显：客户端在本地就把消息显示出来了，再回一份就重了）
+void ChatServer::broadcastChat(Connection* sender, const std::string& body)
+{
+    const std::string payload = buildChatPayload('B', sender->nick, body);
+    for (Connection* c : loggedConns()) {
+        if (c == sender) continue;
+        sendFrame(c, proto::Chat, payload);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,8 +670,14 @@ void ChatServer::closeConn(Connection* conn, const std::string& reason)
             conn->nick.empty() ? "" : (" 昵称=" + conn->nick).c_str(),
             reason.c_str());
 
-    // 第 3 课：这里还要从 nameIndex_（昵称 → fd）里摘掉 conn->nick，
-    //          并给其他在线的人广播一次新的 Users 名单
+    // 第 3 课：同步清理"业务世界的地址"。
+    // 忘了这一步 = 幽灵用户：人已经走了，名单里还挂着他的名字，
+    // 别人私聊他还能"发出去"（发向一个已关闭的 fd），名单也越列越长。
+    if (!conn->nick.empty()) {
+        nameIndex_.erase(conn->nick);
+        conn->nick.clear();
+        usersDirty_ = true;     // 名单少了人 → 安全点广播新名单
+    }
 
     loop_.removeChannel(conn->channel.get());   // 从 epoll 摘掉
     ::close(conn->fd);                          // 关 fd
@@ -468,17 +692,24 @@ void ChatServer::closeConn(Connection* conn, const std::string& reason)
 // 安全点到了：本轮所有回调都已返回，可以放心销毁
 void ChatServer::reapPending()
 {
-    if (pendingReap_.empty())
-        return;
+    if (!pendingReap_.empty()) {
+        logLine("[reap] 安全回收 %zu 个连接对象（此刻所有回调均已返回）", pendingReap_.size());
+        pendingReap_.clear();    // unique_ptr 析构 → Channel 析构
+    }
 
-    logLine("[reap] 安全回收 %zu 个连接对象（此刻所有回调均已返回）", pendingReap_.size());
-    pendingReap_.clear();    // unique_ptr 析构 → Channel 析构
+    // 名单在本轮变过？统一在这里广播一次。
+    // 为什么不"谁登录/下线就谁立刻广播"？因为广播里 sendFrame 失败会 closeConn →
+    // 又触发广播……层层嵌套（重入），很容易写出难查的 bug。
+    // 延迟到安全点、一次播完：逻辑最简单，也最安全。
+    if (usersDirty_) {
+        usersDirty_ = false;
+        broadcastUsers();
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 发送：先塞进 out，再尽力 flush 出去
-// 第 5 课会把"没发完的部分"配上 EPOLLOUT，等内核可写了自动续发；
-// 现在消息都很短，一次 send 基本能出去，剩下了就说明内核发送缓冲满了。
+// 发送：先塞进 out（发送缓冲），再尽力 flush 出去。
+// 发不完没关系 —— flush 会给这条连接挂上 EPOLLOUT，等内核可写了自动续发。
 // ---------------------------------------------------------------------------
 void ChatServer::sendFrame(Connection* conn, uint32_t type, const std::string& payload)
 {
@@ -488,6 +719,30 @@ void ChatServer::sendFrame(Connection* conn, uint32_t type, const std::string& p
     flush(conn);
 }
 
+// 发一条 Error 帧。两种用法：
+//   fatal=true  → 错误不可恢复（协议错误），发完就断开；
+//   fatal=false → 用户还能修正后重试（比如换个昵称），只提示、不断开。
+void ChatServer::sendError(Connection* conn, const std::string& text, bool fatal)
+{
+    logLine("[!] fd=%d 发 Error：%s%s", conn->fd, text.c_str(), fatal ? "（随后断开）" : "");
+    sendFrame(conn, proto::Error, text);
+    if (fatal && !conn->closing)
+        closeConn(conn, "致命错误：" + text);
+}
+
+// ---------------------------------------------------------------------------
+// 【第 5 课】把 out 里的字节尽量发出去；发不完就交给 EPOLLOUT 续发
+//
+// send() 不保证全发出去：内核发送缓冲满了，就只能发一半（或干脆 EAGAIN）。
+// 聊天消息可能几十 KB，必须处理"发到一半"：
+//   没发完的留在 out 里，给这条连接挂上 EPOLLOUT，等内核腾出缓冲自动续发。
+//
+// ⚠️ 两个关键点（LT 水平触发）：
+//   ① 发完了必须立刻 disableWriting —— LT 下只要发送缓冲还有空位，"可写"就会一直响，
+//      不摘掉的话每条连接都会被不停叫醒，事件循环空转、CPU 打满；
+//   ② enableWriting 只改内存里的 events_，必须 updateChannel 同步给 epoll，
+//      否则"事件永远不来"。
+// ---------------------------------------------------------------------------
 void ChatServer::flush(Connection* conn)
 {
     while (!conn->out.empty()) {
@@ -495,18 +750,37 @@ void ChatServer::flush(Connection* conn)
         const ssize_t n = ::send(conn->fd, conn->out.data(), conn->out.size(), MSG_NOSIGNAL);
 
         if (n > 0) {
-            conn->out.erase(0, static_cast<size_t>(n));
+            conn->out.erase(0, static_cast<size_t>(n));   // 发出去的从缓冲里删掉
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            logLine("[!] fd=%d 内核发送缓冲已满，还有 %zu 字节没发出去（第 5 课用 EPOLLOUT 续发）",
-                    conn->fd, conn->out.size());
+            // 内核发送缓冲满了：剩下的留着，挂 EPOLLOUT 等可写
+            if (!conn->channel->isWriting()) {
+                conn->channel->enableWriting();
+                loop_.updateChannel(conn->channel.get());   // 改了 events_ 必须同步！
+                logLine("[~] fd=%d 发送缓冲满，剩 %zu 字节，改由 EPOLLOUT 续发",
+                        conn->fd, conn->out.size());
+            }
             return;
         }
 
         closeConn(conn, "send 失败");
         return;
     }
+
+    // 全发完了：把 EPOLLOUT 摘掉，免得 LT 模式下一直空转叫醒事件循环
+    if (conn->channel->isWriting()) {
+        conn->channel->disableWriting();
+        loop_.updateChannel(conn->channel.get());
+        logLine("[~] fd=%d 续发完成，EPOLLOUT 已摘除", conn->fd);
+    }
+}
+
+// EPOLLOUT 回调：内核说"这个 fd 现在可写了" → 把剩下的继续发
+void ChatServer::onWrite(Connection* conn)
+{
+    if (conn->closing) return;
+    flush(conn);
 }
 
 // ---------------------------------------------------------------------------
