@@ -1,0 +1,18 @@
+********* Start testing of HttpTests *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : HttpTests::initTestCase()
+PASS   : HttpTests::response(success)
+PASS   : HttpTests::response(not-found)
+PASS   : HttpTests::response(manual-redirect)
+PASS   : HttpTests::response(partial-200)
+PASS   : HttpTests::bodyAndHeaders()
+PASS   : HttpTests::connectionFailure()
+PASS   : HttpTests::headResponse()
+PASS   : HttpTests::timeoutAndCancel()
+PASS   : HttpTests::responseCapAndMetadataOnly()
+PASS   : HttpTests::validation()
+PASS   : HttpTests::reentrantCompletion()
+PASS   : HttpTests::destroyActiveRequest()
+PASS   : HttpTests::cleanupTestCase()
+Totals: 14 passed, 0 failed, 0 skipped, 0 blacklisted, 4550ms
+********* Finished testing of HttpTests *********

@@ -1,0 +1,42 @@
+[
+  {
+    "ModuleName": "Qt6Network.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\Qt6Network.dll"
+  },
+  {
+    "ModuleName": "Qt6Widgets.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\Qt6Widgets.dll"
+  },
+  {
+    "ModuleName": "Qt6Gui.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\Qt6Gui.dll"
+  },
+  {
+    "ModuleName": "Qt6Core.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\Qt6Core.dll"
+  },
+  {
+    "ModuleName": "VCRUNTIME140.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\VCRUNTIME140.dll"
+  },
+  {
+    "ModuleName": "MSVCP140.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\MSVCP140.dll"
+  },
+  {
+    "ModuleName": "VCRUNTIME140_1.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\VCRUNTIME140_1.dll"
+  },
+  {
+    "ModuleName": "MSVCP140_1.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\MSVCP140_1.dll"
+  },
+  {
+    "ModuleName": "MSVCP140_2.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\MSVCP140_2.dll"
+  },
+  {
+    "ModuleName": "qwindows.dll",
+    "FileName": "F:\\codexproject\\learningC\\dist\\LearningCStudio\\platforms\\qwindows.dll"
+  }
+]

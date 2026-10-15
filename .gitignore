@@ -1,6 +1,10 @@
 # 构建产物（可随时删除重建）
 build/
 build-release/
+build-qt*/
+dist/
+qt-client/.qt/
+qt-client/build*/
 cmake_practice/
 
 # 运行输出

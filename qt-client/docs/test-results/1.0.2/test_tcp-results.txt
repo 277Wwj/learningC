@@ -1,0 +1,22 @@
+********* Start testing of TcpTests *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : TcpTests::initTestCase()
+PASS   : TcpTests::literalWireVector()
+PASS   : TcpTests::directConnectionIgnoresApplicationProxy()
+PASS   : TcpTests::wholeAndNoWelcome()
+PASS   : TcpTests::splitAndPreventInterleaving()
+PASS   : TcpTests::coalescedSend()
+PASS   : TcpTests::fragmentedAndCoalescedReceive()
+PASS   : TcpTests::maxPayloadAndManyFrames()
+PASS   : TcpTests::malformedFrame(body-too-small)
+PASS   : TcpTests::malformedFrame(payload-over-64KiB)
+PASS   : TcpTests::malformedFrame(uint32-overflow)
+PASS   : TcpTests::malformedFrame(bad-magic-before-body)
+PASS   : TcpTests::refusalAndRemoteClose()
+PASS   : TcpTests::disconnectFlushesWholeFrames()
+PASS   : TcpTests::disconnectCancelsSplitAndReconnectIsClean()
+PASS   : TcpTests::replacingConnectionCancelsSplit()
+PASS   : TcpTests::sendQueueIsBounded()
+PASS   : TcpTests::cleanupTestCase()
+Totals: 18 passed, 0 failed, 0 skipped, 0 blacklisted, 4270ms
+********* Finished testing of TcpTests *********

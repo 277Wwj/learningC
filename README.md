@@ -1,12 +1,38 @@
-# WebServer —— 基于 epoll + Reactor 的高并发 HTTP 服务器
+# learningC：Linux C++ 网络服务与 Qt 调试客户端
 
-> 从零手写的 C++ HTTP 服务器：epoll（ET 边缘触发）+ Reactor 架构，三个演进版本
+本仓库记录 C++ 网络编程学习过程，包含三个 HTTP 服务端版本、LCH1 聊天中转服务，以及独立的 **[LearningC Studio Qt 客户端](qt-client/README.md)**。部分实现由 AI 辅助完成；功能是否可靠以源码、测试与实际联调结果为依据。
+
+## 项目入口
+
+| 模块 | 运行环境 | 功能与入口 |
+| --- | --- | --- |
+| HTTP 服务端 | Linux / C++17 | 单 Reactor、线程池、主从 Reactor；端口 8080，详见下文 |
+| 聊天服务端 | Linux / C++17 | `src/chat_server.cpp`，端口 12735；登录、在线名单、群聊、私聊与退出 |
+| LearningC Studio 1.0.2 | Qt 6 / C++17；已在 Windows 构建验证 | [HTTP 调试、轻量并发测试、TCP 协议帧观察](qt-client/README.md) |
+| 测试与说明 | Linux / Windows 分开执行 | [联调步骤](qt-client/docs/DEMO.md)、[客户端架构](qt-client/docs/ARCHITECTURE.md)、[客户端测试记录](qt-client/docs/TESTING.md)、[本次上传记录](qt-client/docs/PUBLISH.md) |
+
+Windows 构建客户端只需配置 `qt-client/CMakeLists.txt`，不编译 Linux epoll 工程。客户端连接已经启动的 Linux 服务，不能替代服务端；跨机器填写 Linux 的可达 IP，Windows 上的 `127.0.0.1` 指 Windows 自己。
+
+```powershell
+# 在仓库根目录执行；改成自己的 Qt SDK 路径。
+.\qt-client\scripts\build.ps1 -QtPath 'C:\Qt\6.8.3\msvc2022_64'
+# 生成包含依赖的 Windows 运行包（输出到 dist，不提交构建产物）。
+.\qt-client\scripts\package.ps1 -QtPath 'C:\Qt\6.8.3\msvc2022_64'
+```
+
+客户端 TCP 页面是协议调试工具：手动发送 Login 后检查 Welcome/Error，可开两个进程验证 Say → Chat。它没有联系人会话界面，也不把 TCP 建连当作登录成功。[协议及演示步骤](qt-client/docs/DEMO.md#实验四tcp-登录名单和消息转发)
+
+以下保留原 HTTP 项目的架构说明与历史测量。**历史 wrk 数据不是本次重新测得的结果；Qt 客户端逐请求新连接的测量不能与它直接比较。** HTTP 行为按不同程序区分：`webserver` 提供 `/`、`/hello` 和 404；`webserver_thread` 提供 `/`、`/slow` 和 404；`webserver_multithread` 对不同路径返回固定 200。
+
+## HTTP 服务端概览
+
+> C++ HTTP 服务器学习实现：epoll + Reactor 架构，三个演进版本
 > （单线程 → 线程池 → 主从 Reactor），支持 keep-alive、粘包/半包处理、连接超时、优雅关闭。
 > **wrk 压测：单线程 5.0 万 QPS，主从 5.3 万 QPS。**
 
 ## 功能特性
 
-- **IO 多路复用**：epoll（ET 边缘触发）+ 非阻塞 IO
+- **IO 多路复用**：epoll + 非阻塞 IO；当前共享 `Channel` 使用 LT，线程池与主从版直接使用 epoll 的部分设置 ET，需按源码区分
 - **三种演进版本**：单线程 → 线程池 → 主从 Reactor（一主多从，多核并行）
 - **Reactor 架构**：自研 `EventLoop` / `Poller` / `Channel` / `Buffer` 框架
 - **HTTP/1.1 支持**：GET 请求解析、keep-alive 长连接、404 处理
@@ -37,7 +63,7 @@
 ## 技术栈
 
 - 语言：C++17
-- IO：epoll、ET 边缘触发、非阻塞 socket
+- IO：epoll、LT/ET 触发模式、非阻塞 socket
 - 架构：Reactor（EventLoop / Poller / Channel / Buffer）、主从 Reactor（多线程）
 - 定时：timerfd、eventfd
 - 工具链：CMake、GDB、GTest、valgrind、strace、wrk / ab（压测）
@@ -75,7 +101,7 @@ curl http://127.0.0.1:8080/hello      # Hello
 curl http://127.0.0.1:8080/xyz        # 404
 
 # 单元测试
-ctest --test-dir build --output-on-failure
+ctest --test-dir build-release --output-on-failure
 
 # 压测
 wrk -t2 -c100 -d20s http://127.0.0.1:8080/
@@ -96,6 +122,11 @@ src/
   chat_server.cpp           # 衍生项目：聊天中转服务器
 tests/
   buffer_test.cpp / eof.cpp # Buffer 单元测试（GTest）
+  chat_smoke_test.py        # 聊天业务冒烟测试（需要先启动 chat_server）
+qt-client/
+  CMakeLists.txt            # 独立 Qt 客户端工程
+  scripts/                 # Windows 构建与部署脚本
+  docs/                    # 架构、操作步骤、测试记录和截图
 ```
 
 ## 踩过的坑（面试重点）
@@ -117,6 +148,8 @@ tests/
 8. **accept 队列太小**：`listen(fd, 10)` 在短连接风暴下排队溢出，导致连接超时。改为 1024。
 
 ## TODO（进阶方向）
+
+聊天服务的后续验证重点：数据与 EOF 同时到达的处理、转发后的载荷上限、慢客户端积压限制。此列表是待验证/改进事项，不代表本次上传已修复后端。
 
 - [ ] 主从版：连接超时清理（timerfd）
 - [ ] POST 请求与请求体解析
