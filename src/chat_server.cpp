@@ -82,6 +82,8 @@ enum Type : uint32_t {
     Chat    = 5,   // S→C  payload = [1B 模式][发送者昵称+'\0'][正文]
     Bye     = 6,   // C→S  主动退出，payload 空
     Error   = 7,   // S→C  错误文本（分两种：致命错误随后断开；可恢复错误只提示不断开）
+    Ping = 8,   // C→S  心跳，payload 空
+    Pong = 9,   // 预留：本课不发送
 };
 
 const char* typeName(uint32_t t)
@@ -94,7 +96,10 @@ const char* typeName(uint32_t t)
     case Chat:    return "Chat";
     case Bye:     return "Bye";
     case Error:   return "Error";
+    case Ping:    return "Ping";
+    
     default:      return "??未知??";
+
     }
 }
 
@@ -102,7 +107,7 @@ const char* typeName(uint32_t t)
 
 // 运行参数
 static constexpr int kHousekeepSec   = 5;    // 定时器周期：多久扫一遍空闲连接
-static constexpr int kIdleTimeoutSec = 120;  // 多久没收到任何数据就踢掉。
+static constexpr int kIdleTimeoutSec = 65;  // 多久没收到任何数据就踢掉。20*3+5;
                                              // 更"正统"的做法是协议层心跳（Ping/Pong），
                                              // 等接 Qt 客户端时一起升级（见精读文档"下一步"）
 
@@ -476,14 +481,18 @@ void ChatServer::onRead(Connection* conn)
 // ---------------------------------------------------------------------------
 void ChatServer::handleFrame(Connection* conn, uint32_t type, const std::string& payload)
 {
-    logLine("[<] fd=%d type=%s(%u) payload=%zu字节 \"%s\"",
+    if (type != proto::Ping){
+        logLine("[<] fd=%d type=%s(%u) payload=%zu字节 \"%s\"",
             conn->fd, proto::typeName(type), type,
             payload.size(), printable(payload).c_str());
+    };
+    
 
     switch (type) {
     case proto::Login: handleLogin(conn, payload); break;
     case proto::Say:   handleSay(conn, payload);   break;
     case proto::Bye:   handleBye(conn);            break;
+    case proto::Ping:                              break;
     default:
         // Welcome / Users / Chat / Error 都是"服务器→客户端"的方向，
         // 客户端不该发过来；收到就说明对方不是我们的客户端，或客户端写飞了

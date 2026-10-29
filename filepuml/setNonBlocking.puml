@@ -1,0 +1,110 @@
+@startuml setNonBlocking
+title ChatServer::onAccept 流程图（含 setNonBlocking）
+
+skinparam shadowing false
+skinparam conditionEndStyle hline
+skinparam ActivityBackgroundColor #FFFFFF
+skinparam ActivityBorderColor #333333
+skinparam ArrowColor #444444
+
+start
+
+:EventLoop 收到 EPOLLIN
+（listenCh_ 就绪）;
+note right
+  listen socket 在 start() 第 308 行
+  已调用 setNonBlocking(listenFd_)，
+  所以下面的 accept 循环
+  才能靠 EAGAIN 判断"取完了"
+end note
+
+repeat
+  :fd = ::accept(listenFd_, nullptr, nullptr);
+
+  if (fd < 0 ?) then (是)
+    if (errno 是哪个？) then (EAGAIN / EWOULDBLOCK)
+      #LightGreen:新连接都取完了 → break;
+      detach
+    else if (EINTR) then
+      #LightYellow:被信号打断 → continue 重试;
+      detach
+    else (其他错误)
+      #LightCoral:perror("accept") → break;
+      detach
+    endif
+  else (fd >= 0：拿到新连接)
+    ' ============ setNonBlocking(fd) ============
+    #LightBlue:setNonBlocking(fd);
+    note right
+      **为什么必须设成非阻塞？**
+
+      后面全是"单线程 Reactor + epoll
+      水平触发"模型：
+      · recv 必须能立刻返回 EAGAIN，
+        否则一个慢客户端会卡死整个事件循环
+      · send 缓冲满时必须能拿到 EAGAIN，
+        才会走 EPOLLOUT 续发逻辑
+    end note
+
+    :int flags = fcntl(fd, F_GETFL, 0);
+    :fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    note right
+      两行代码的要点：
+      ① 先取当前标志位，保留其他位
+         （不能直接 F_SETFL, O_NONBLOCK，
+         那样会清掉原有标志）
+      ② 按位或上 O_NONBLOCK 再写回
+    end note
+
+    ' ============ 构造 Connection ============
+    :auto conn = make_unique<Connection>();
+    :conn->fd        = fd;
+    :conn->lastActive = time(nullptr);
+    :conn->channel   = make_unique<Channel>(fd);
+
+    note right
+      Channel 只是 "fd + 4 个回调"的包装，
+      由 Connection 持有
+    end note
+
+    ' ============ 注册回调 ============
+    :Connection* raw = conn.get();
+    note right
+      **先取裸指针，再 std::move**
+      回调里要捕获 Connection*，
+      而对象所有权随后转进 conns_
+    end note
+
+    :channel->setReadCallback (onRead(raw));
+    :channel->setWriteCallback(onWrite(raw));
+    :channel->setErrorCallback(closeConn(raw, "EPOLLERR"));
+    :channel->setCloseCallback(closeConn(raw, "EPOLLHUP"));
+
+    :channel->enableReading();
+
+    :loop_.updateChannel(channel.get());
+    note right
+      只改 Channel 内存里的 events_ 不够，
+      必须同步给 epoll
+      （首次 ADD，之后 MOD）
+    end note
+
+    :conns_[fd] = std::move(conn);
+
+    :logLine("[+] 新连接 fd=%d（当前 %zu 个连接）");
+    note right
+      安全性由两条保证：
+      ① 连接不会当场销毁（挂 pendingReap_，
+         回到安全点统一回收）
+      ② 每个回调开头检查 closing
+    end note
+  endif
+
+repeat while (继续循环？) is (是) not (否)
+
+#LightGreen:退出 onAccept，回到 EventLoop;
+
+stop
+
+@enduml

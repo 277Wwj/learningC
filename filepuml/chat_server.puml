@@ -1,0 +1,202 @@
+@startuml chat_server
+title src/chat_server.cpp 类图
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+
+' ===========================================================
+' 协议层：命名空间 proto
+' ===========================================================
+package "proto (命名空间)" as protoPkg {
+  class "proto::Type" as ProtoType <<enumeration>> {
+    Login = 1
+    Welcome = 2
+    Users = 3
+    Say = 4
+    Chat = 5
+    Bye = 6
+    Error = 7
+  }
+
+  class "proto 常量" as ProtoConst <<constants>> {
+    +kPort : uint16_t = 12735
+    +kMagic : uint32_t = 0x4C434831
+    +kHeaderLen : uint32_t = 12
+    +kMaxPayload : uint32_t = 64 KiB
+    +kMaxNickLen : size_t = 32
+    +typeName(t : uint32_t) : const char*
+  }
+}
+
+' ===========================================================
+' 一条连接
+' ===========================================================
+class Connection {
+  +fd : int = -1
+  +channel : unique_ptr<Channel>
+  +in : Buffer
+  +out : string
+  +nick : string
+  +lastActive : time_t
+  +closing : bool = false
+}
+
+' ===========================================================
+' 服务器
+' ===========================================================
+class ChatServer {
+  -loop_ : EventLoop
+  -listenFd_ : int = -1
+  -listenCh_ : unique_ptr<Channel>
+  -timerCh_ : unique_ptr<Channel>
+  -wakeupCh_ : unique_ptr<Channel>
+  -conns_ : unordered_map<int, unique_ptr<Connection>>
+  -pendingReap_ : vector<unique_ptr<Connection>>
+  -nameIndex_ : unordered_map<string, int>
+  -usersDirty_ : bool = false
+  __
+  +start(port : uint16_t) : bool
+  +run() : void
+  .. 事件回调 ..
+  -onAccept() : void
+  -onRead(conn : Connection*) : void
+  -onWrite(conn : Connection*) : void
+  -onIdleTick() : void
+  -onWakeup() : void
+  .. 连接生命周期 ..
+  -closeConn(conn : Connection*, reason : string) : void
+  -reapPending() : void
+  .. 收发 ..
+  -sendFrame(conn : Connection*, type : uint32_t, payload : string) : void
+  -sendError(conn : Connection*, text : string, fatal : bool) : void
+  -flush(conn : Connection*) : void
+  -handleFrame(conn : Connection*, type : uint32_t, payload : string) : void
+  .. 业务 ..
+  -handleLogin(conn : Connection*, payload : string) : void
+  -handleSay(conn : Connection*, payload : string) : void
+  -handleBye(conn : Connection*) : void
+  -loggedConns() : vector<Connection*>
+  -onlineNicks() : string
+  -broadcastUsers() : void
+  -broadcastChat(sender : Connection*, body : string) : void
+}
+
+' ===========================================================
+' 依赖的基础设施（include/ 下的头文件）
+' ===========================================================
+package "事件循环基础设施 (include/)" as infra {
+
+  class Buffer {
+    -data_ : vector<char>
+    -readIndex_ : size_t
+    -writeIndex_ : size_t
+    --
+    +readFd(fd : int) : int
+    +readableBytes() : size_t
+    +peek() : const char*
+    +retrieve(n : size_t) : void
+    +retrieveAllAsString() : string
+    -append(data : const char*, len : size_t) : void
+  }
+
+  class Channel {
+    -fd_ : int
+    -events_ : int
+    -readCallback_ : Callback
+    -writeCallback_ : Callback
+    -closeCallback_ : Callback
+    -errorCallback_ : Callback
+    --
+    +setReadCallback(cd : Callback) : void
+    +setWriteCallback(cd : Callback) : void
+    +setCloseCallback(cb : Callback) : void
+    +setErrorCallback(cb : Callback) : void
+    +enableReading() : void
+    +enableWriting() : void
+    +disableWriting() : void
+    +isWriting() : bool
+    +handleEvent(revents : int) : void
+    +fd() : int
+    +events() : int
+  }
+
+  class EventLoop {
+    -poller_ : Poller
+    -running_ : atomic<bool>
+    -postDispatch_ : Functor
+    --
+    +updateChannel(ch : Channel*) : void
+    +removeChannel(ch : Channel*) : void
+    +setPostDispatch(f : Functor) : void
+    +loop() : void
+    +quit() : void
+  }
+
+  class Poller {
+    +updateChannel(ch : Channel*) : void
+    +removeChannel(ch : Channel*) : void
+    +poll() : vector<pair<Channel*, int>>
+  }
+}
+
+' ===========================================================
+' 匿名命名空间里的小工具函数
+' ===========================================================
+package "匿名命名空间 (工具函数)" as utilPkg {
+  class "工具函数" as Utils <<functions>> {
+    +setNonBlocking(fd : int) : void
+    +logLine(fmt : const char*, ...) : void
+    +readBe32(p : const char*) : uint32_t
+    +packFrame(type : uint32_t, payload : string) : string
+    +printable(s : string, maxLen : size_t) : string
+    +isValidNick(nick : string) : bool
+    +buildChatPayload(mode : char, from : string, body : string) : string
+    +onSigint(sig : int) : void
+  }
+}
+
+' ===========================================================
+' 关系
+' ===========================================================
+ChatServer o--> "0..*" Connection : 持有 conns_\nfd → 连接
+ChatServer o--> "0..*" Connection : 待回收 pendingReap_
+ChatServer --> Connection : nameIndex_\n昵称 → fd
+ChatServer *-- EventLoop : loop_
+ChatServer *-- "3" Channel : listenCh_ / timerCh_ / wakeupCh_
+Connection *-- "1" Channel : channel
+Connection *-- "1" Buffer : in
+
+EventLoop o--> Poller : poller_
+Channel --> EventLoop : updateChannel()
+
+ChatServer ..> Buffer : 收发缓冲
+ChatServer ..> Channel : 注册/摘除 epoll
+ChatServer ..> ProtoType : 帧类型分派
+ChatServer ..> Utils : 组帧 / 日志 / 校验
+
+Connection ..> Utils : 昵称校验
+Utils ..> ProtoConst : kHeaderLen / kMagic
+
+' ===========================================================
+' 备注
+' ===========================================================
+note top of ChatServer
+  单线程 Reactor：
+  EventLoop 负责 epoll_wait，
+  Channel 负责"fd + 回调"，
+  ChatServer 负责业务分发。
+end note
+
+note bottom of Connection
+  所有权：unique_ptr 放在 conns_ 里；
+  回调只捕获裸指针，靠
+  closing 标记 + 延迟回收保证安全。
+end note
+
+note right of ChatServer::reapPending
+  安全点：所有回调返回后才
+  销毁连接，避免 use-after-free；
+  名单广播也在这里统一做，防重入。
+end note
+
+@enduml

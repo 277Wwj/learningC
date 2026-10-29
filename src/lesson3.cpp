@@ -36,7 +36,7 @@ int main(){
     if(FD_ISSET(listen_fd,&readfds)){
         int c=accept(listen_fd,nullptr,nullptr);
         clients.push_back(c);
-        printf("新客户端连接 fd=%d\n,当前客户端数量: %lu\n",c,clients.size());
+        printf("新客户端连接 fd=%d, 当前客户端数量: %lu\n",c,clients.size());
 
     }
     for(auto it=clients.begin();it!=clients.end();){
