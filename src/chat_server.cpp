@@ -233,6 +233,21 @@ struct Connection {
     std::string nick;           // 登录后才有值（第 3 课）；同时也是"名单里的我"
     time_t lastActive = 0;      // 最后一次"有动静"的时间，用于踢空闲连接
     bool closing = false;       // 已在关闭流程中：所有回调看到它就立刻返回
+
+    // ---- 半关闭支持（第 7 课）----
+    // 对端发来了 FIN（关闭了它的写方向），但我们这边还可以继续发。
+    // TCP 是双向的，close 只关"我"这一端；对端 shutdown(SHUT_WR) 时，
+    // 我们还能把缓冲里剩下的话说完再收工。
+    //
+    // 为什么不在读到 FIN 时直接 closeConn？
+    //   ① 客户端 send 完立刻 close 的话，数据帧和 FIN 会一起到：
+    //      丢掉数据 = 用户发的最后一条消息凭空消失
+    //   ② 半关闭的客户端（shutdown(SHUT_WR)）还在等我们的回复，
+    //      直接 close 会让它读到 EOF 而不是 Welcome
+    bool peerClosedWrite = false;
+    // 我们在对端已经关写之后，把该发的都发完了 —— 这时才真正收工。
+    // 由 flush() 判断（而不是 onRead），因为此刻可能还有数据在 out 里排队。
+    bool closeAfterFlush = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -422,14 +437,40 @@ void ChatServer::onRead(Connection* conn)
 {
     if (conn->closing) return;   // 已经在关闭流程里，别碰它
 
-    const int total = conn->in.readFd(conn->fd);
-    if (total < 0) {             // readFd 返回 -1 = 对端关闭 / 读出错
-        closeConn(conn, "对端关闭");
-        return;
-    }
+    // ---- 第 7 课修复：把"读到多少"和"连接死没死"分开 ----
+    //
+    // 旧代码是 `if (total < 0) { closeConn(...); return; }`，
+    // 而 Buffer::readFd 在收到 FIN 时返回 -1 —— 于是**缓冲里刚读到的整帧被丢弃**。
+    //
+    // 触发场景（都不罕见）：
+    //   · 客户端 send 完立刻 close（数据帧 + FIN 一起到）
+    //   · 客户端 shutdown(SHUT_WR) 后还在等回复（半关闭）
+    //   · printf '...' | nc 127.0.0.1 12735 —— 管道输入结束就关写方向
+    //
+    // 正确顺序：**先把缓冲里的数据全部处理完，再根据连接状态决定是否关闭。**
+    Buffer::ReadStatus status = Buffer::ReadStatus::Ok;
+    int readErrno = 0;
+    const int total = conn->in.readFd(conn->fd, status, &readErrno);
+
     if (total > 0)
         conn->lastActive = time(nullptr);
 
+    if (status == Buffer::ReadStatus::PeerClosed) {
+        // EOF 不等于"数据不可用"：先打个标记，让下面的拆帧循环照常跑完。
+        // 真正的收工动作推迟到 flush() 里（可能还有话没说完）。
+        conn->peerClosedWrite = true;
+        logLine("[~] fd=%d 对端关闭写方向（本次已读到 %d 字节），继续处理缓冲",
+                conn->fd, total);
+    } else if (status == Buffer::ReadStatus::Error) {
+        // 真错误：读到的数据不可信，直接断开，不再拆帧
+        logLine("[!] fd=%d 读错误(%s)，断开", conn->fd, strerror(readErrno));
+        closeConn(conn, "读错误");
+        return;
+    }
+
+    // ---- 拆帧循环 ----
+    // 注意循环结束后还要再判断一次 peerClosedWrite：因为我们可能处理了
+    // 好几帧、甚至发送了回复，最后才发现该收工了。
     while (!conn->closing) {
         const size_t readable = conn->in.readableBytes();
 
@@ -470,6 +511,32 @@ void ChatServer::onRead(Connection* conn)
 
         // ---- ⑤ 交给业务层。注意：handleFrame 里可能把这条连接关掉 ----
         handleFrame(conn, type, payload);
+    }
+
+    if (conn->closing) return;
+
+    // ---- ⑥ 半关闭收尾 ----
+    // 走到这里说明缓冲里的完整帧都处理完了。如果对端之前关了写方向，
+    // 现在只剩两件事要做：
+    //   · 缓冲里还有半包（数据不完整）→ 协议层面已经没救了，直接断
+    //   · out 里还有没发出去的数据     → 挂个标记，让 flush() 发完再断
+    if (conn->peerClosedWrite) {
+        if (conn->in.readableBytes() > 0) {
+            logLine("[!] fd=%d 对端关闭时缓冲里有 %zu 字节半包，丢弃",
+                    conn->fd, conn->in.readableBytes());
+            closeConn(conn, "对端关闭（残留半包）");
+            return;
+        }
+        if (conn->out.empty()) {
+            // 没有待发数据，可以立刻收工
+            closeConn(conn, "对端关闭");
+            return;
+        }
+        // 还有话没说完：交给 flush() 收尾（它发完会调 closeConn）
+        conn->closeAfterFlush = true;
+        logLine("[~] fd=%d 对端已关闭写方向，先把剩余 %zu 字节发完再断开",
+                conn->fd, conn->out.size());
+        flush(conn);
     }
 }
 
@@ -783,6 +850,12 @@ void ChatServer::flush(Connection* conn)
         loop_.updateChannel(conn->channel.get());
         logLine("[~] fd=%d 续发完成，EPOLLOUT 已摘除", conn->fd);
     }
+
+    // 第 7 课：如果对端已经关了写方向，且该发的都发完了，现在才真正收工。
+    // 放在这里而不是 onRead 里，是因为 onRead 结束时可能还有数据在 out 里排队，
+    // 那时候 close 会把没发完的回复一起丢掉。
+    if (conn->closeAfterFlush)
+        closeConn(conn, "对端关闭（已发完剩余数据）");
 }
 
 // EPOLLOUT 回调：内核说"这个 fd 现在可写了" → 把剩下的继续发
