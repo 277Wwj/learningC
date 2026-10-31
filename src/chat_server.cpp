@@ -40,10 +40,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -106,6 +112,7 @@ const char* typeName(uint32_t t)
 } // namespace proto
 
 // 运行参数
+static constexpr size_t kSubLoopCount = 4;   // 子 Reactor 数量（建议 = CPU 核数）
 static constexpr int kHousekeepSec   = 5;    // 定时器周期：多久扫一遍空闲连接
 static constexpr int kIdleTimeoutSec = 65;  // 多久没收到任何数据就踢掉。20*3+5;
                                              // 更"正统"的做法是协议层心跳（Ping/Pong），
@@ -248,13 +255,65 @@ struct Connection {
     // 我们在对端已经关写之后，把该发的都发完了 —— 这时才真正收工。
     // 由 flush() 判断（而不是 onRead），因为此刻可能还有数据在 out 里排队。
     bool closeAfterFlush = false;
+
+    // ---- 主从 Reactor：这条连接属于哪个子 loop ----
+    // 除 fd/in/out/channel 之外的所有字段，都只在 owner 线程里读写。
+    size_t owner = 0;           // 子 loop 下标（也用来找到它的 EventLoopThread）
+    int    subFd = -1;          // 在子 loop 里的 fd 副本（close 之后 fd 值不可靠时用）
 };
 
 // ---------------------------------------------------------------------------
-// 四、服务器
+// 四、子 Reactor：一个 EventLoop + 一个线程
+//
+// 为什么单独包一层？因为 EventLoop 本身不含线程，也不管生命周期。
+// 主从模型里我们需要"loop 跑在自己的线程里，并且能等它起来"。
+// ---------------------------------------------------------------------------
+class EventLoopThread {
+public:
+    // 启动线程并阻塞到 EventLoop 构造完成（否则 join 时机不确定）
+    void start()
+    {
+        std::promise<EventLoop*> p;
+        auto ready = p.get_future();
+        thread_ = std::thread([this, &p] {
+            EventLoop loop;              // 在子线程里构造，owner_ 才是子线程 id
+            p.set_value(&loop);
+            loop.loop();                 // quit() 之后返回
+        });
+        loop_ = ready.get();
+    }
+
+    EventLoop* loop() const { return loop_; }
+    std::thread::id id() const { return thread_.get_id(); }
+
+    // 先 quit 再 join —— 顺序反了会卡死（B1 实验的教训）
+    void stop()
+    {
+        if (loop_) loop_->quit();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    void join() { if (thread_.joinable()) thread_.join(); }
+
+private:
+    EventLoop* loop_ = nullptr;
+    std::thread thread_;
+};
+
+// ---------------------------------------------------------------------------
+// 五、服务器
 // ---------------------------------------------------------------------------
 class ChatServer {
 public:
+    // ---- 每个子 loop 私有的连接表 ----
+    // 关键设计：conns 按 loop 分表，而不是一张全局表。
+    // 这样"遍历自己负责的连接"完全不需要加锁 —— 只有本线程会改它。
+    struct SubState {
+        std::unordered_map<int, std::unique_ptr<Connection>> conns;   // fd → 连接
+        std::vector<std::unique_ptr<Connection>> pendingReap;         // 待回收（安全点销毁）
+        bool usersDirty = false;                                      // 名单变过 → 安全点广播
+    };
+
     bool start(uint16_t port);
     void run();
 
@@ -280,21 +339,44 @@ private:
     void handleLogin(Connection* conn, const std::string& payload);
     void handleSay(Connection* conn, const std::string& payload);
     void handleBye(Connection* conn);
-    std::vector<Connection*> loggedConns() const;   // 已登录连接快照（遍历时的安全做法）
+    std::vector<Connection*> loggedConnsOf(SubState& st) const;  // 本 loop 已登录连接快照
     std::string onlineNicks() const;                // Users 名单：全部在线昵称，'\n' 分隔
     void broadcastUsers();                          // 名单变了 → 推给所有已登录的人
     void broadcastChat(Connection* sender, const std::string& body);   // 群发转发
 
-    EventLoop loop_;
+    // ---- 主从 Reactor 的辅助 ----
+    // 在目标子 loop 的线程里创建并登记一条连接（必须由 runInSub 投递进来）
+    void adoptConnection(int fd, size_t idx);
+    // 把"在目标 loop 线程里执行"这件事统一封装，避免到处写 runInLoop 样板
+    void runInSub(size_t idx, std::function<void()> fn);
+    // 遍历所有子 loop，把 fn 投递到每个 loop 的线程
+    void forEachSub(const std::function<void(size_t)>& fn);
+    // 在【当前线程所属的 loop】里执行（用于回调内部，避免重复投递）
+    size_t currentSubIndex() const;
+
+    EventLoop loop_;                       // 主 Reactor：只管 accept + 定时器 + 信号
     int listenFd_ = -1;
     std::unique_ptr<Channel> listenCh_;
     std::unique_ptr<Channel> timerCh_;
     std::unique_ptr<Channel> wakeupCh_;
 
-    std::unordered_map<int, std::unique_ptr<Connection>> conns_;   // fd → 连接（IO 世界的地址）
-    std::vector<std::unique_ptr<Connection>> pendingReap_;         // 待回收（安全点统一销毁）
-    std::unordered_map<std::string, int> nameIndex_;               // 昵称 → fd（业务世界的地址）
-    bool usersDirty_ = false;   // 名单变过吗？→ 安全点统一广播一次（防重入，见 reapPending）
+    // ---- 子 Reactor 池 ----
+    // 每个子 loop 有自己的 epoll、自己的线程、自己的连接集合。
+    // 连接一旦分给某个子 loop，它的所有 IO 都只在那条线程里发生。
+    std::vector<std::unique_ptr<EventLoopThread>> subLoops_;
+    std::atomic<size_t> nextLoop_{0};      // 轮询分配用的计数器
+
+    std::vector<std::unique_ptr<SubState>> subStates_;
+
+    // ---- 全局昵称索引（跨 loop 共享，必须加锁）----
+    // 为什么这张表不能分片？因为私聊要"按昵称找 fd"，而昵称属于哪个 loop
+    // 事先不知道。所以它必须是全局的。
+    // 用 shared_mutex：查（find）远多于改（登录/下线），读多写少。
+    mutable std::shared_mutex nameMutex_;
+    std::unordered_map<std::string, std::pair<size_t, int>> nameIndex_;   // 昵称 → (loop 下标, fd)
+
+    // ---- 全局连接计数（只用于日志和统计）----
+    std::atomic<size_t> connCount_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -359,29 +441,140 @@ bool ChatServer::start(uint16_t port)
     wakeupCh_->enableReading();
     loop_.updateChannel(wakeupCh_.get());
 
-    // ---- 4. 安全点：每轮事件分发结束后的收尾工作 ----
+    // ---- 4. 安全点：主 loop 每轮事件分发结束后的收尾工作 ----
     loop_.setPostDispatch([this] { reapPending(); });
+
+    // ---- 5. 启动子 Reactor 池 ----
+    // 必须最后启动：前面任何一步失败都不该留下跑着的线程。
+    subLoops_.reserve(kSubLoopCount);
+    subStates_.reserve(kSubLoopCount);
+    for (size_t i = 0; i < kSubLoopCount; ++i) {
+        subStates_.push_back(std::make_unique<SubState>());
+
+        auto t = std::make_unique<EventLoopThread>();
+        t->start();
+        EventLoop* sub = t->loop();
+
+        // 每个子 loop 自己做安全点回收 + 名单广播。
+        // 注意：广播要跨所有 loop，所以这里只是一个"触发器"，
+        // 真正的广播由 broadcastUsers() 投递到各个 loop 完成。
+        SubState* st = subStates_[i].get();
+        sub->setPostDispatch([this, st] {
+            if (!st->pendingReap.empty()) {
+                logLine("[reap] loop 安全回收 %zu 个连接对象", st->pendingReap.size());
+                st->pendingReap.clear();
+            }
+            if (st->usersDirty) {
+                st->usersDirty = false;
+                broadcastUsers();
+            }
+        });
+
+        subLoops_.push_back(std::move(t));
+        logLine("[+] 子 Reactor #%zu 已启动（共 %zu 个）", i, kSubLoopCount);
+    }
 
     return true;
 }
 
 void ChatServer::run()
 {
-    logLine("聊天中转服务器已启动，监听 0.0.0.0:%u", proto::kPort);
+    logLine("聊天中转服务器已启动，监听 0.0.0.0:%u（主 Reactor + %zu 个子 Reactor）",
+            proto::kPort, kSubLoopCount);
     logLine("测试：printf '\\x00\\x00\\x00\\x0a\\x4c\\x43\\x48\\x31\\x00\\x00\\x00\\x01hi' | nc 127.0.0.1 %u",
             proto::kPort);
     logLine("（上面那串十六进制就是一帧 Login，登录昵称 \"hi\"；Ctrl+C 优雅退出）");
     logLine("（完整功能冒烟测试：python3 tests/chat_smoke_test.py；看事件循环调用链：TRACE=1）");
 
-    loop_.loop();
+    loop_.loop();       // 主 loop 退出 = 收到 SIGINT
 
-    // 收尾：把还活着的连接全关掉（loop 已退出，此处单线程操作，安全）
-    for (auto& [fd, conn] : conns_) {
-        loop_.removeChannel(conn->channel.get());
-        ::close(conn->fd);
+    // ---- 关闭顺序（B1/B3 实验的教训：先全部 quit，再全部 join）----
+    // 反例：先 join 一个，它会卡住等 quit，而 quit 还没发出去 → 死锁。
+    logLine("主 Reactor 已退出，正在关闭 %zu 个子 Reactor...", subLoops_.size());
+    for (auto& t : subLoops_)
+        t->loop()->quit();
+    for (auto& t : subLoops_)
+        t->join();
+
+    // 子 loop 全停了，现在可以安全地清理残留（此时没有别的线程在动这些表）
+    for (auto& st : subStates_) {
+        for (auto& [fd, conn] : st->conns) {
+            subLoops_[conn->owner]->loop()->removeChannel(conn->channel.get());
+            ::close(conn->fd);
+        }
+        st->conns.clear();
     }
-    conns_.clear();
+
+    ::close(listenFd_);
     logLine("服务器已优雅退出");
+}
+
+// ---------------------------------------------------------------------------
+// 主从 Reactor 的三个辅助函数
+// ---------------------------------------------------------------------------
+
+// 在目标子 loop 的线程里创建并登记一条连接。
+// ⚠️ 只能通过 runInSub 调用 —— 它假定自己跑在 subLoops_[idx] 的线程里。
+void ChatServer::adoptConnection(int fd, size_t idx)
+{
+    SubState& st = *subStates_[idx];
+
+    auto conn        = std::make_unique<Connection>();
+    conn->fd         = fd;
+    conn->subFd      = fd;
+    conn->owner      = idx;
+    conn->lastActive = time(nullptr);
+    conn->channel    = std::make_unique<Channel>(fd);
+
+    // 回调里只捕获裸指针 Connection*。
+    // 安全性靠两条保证：
+    //   ① 连接对象不会当场销毁（挂到 st.pendingReap，等安全点再销毁）
+    //   ② 每个回调开头检查 closing，已在关闭流程中就立刻返回
+    Connection* raw = conn.get();
+    conn->channel->setReadCallback ([this, raw] { onRead(raw); });
+    conn->channel->setWriteCallback([this, raw] { onWrite(raw); });   // EPOLLOUT：续发半写
+    conn->channel->setErrorCallback([this, raw] { closeConn(raw, "EPOLLERR"); });
+    conn->channel->setCloseCallback([this, raw] { closeConn(raw, "EPOLLHUP"); });
+
+    conn->channel->enableReading();
+    subLoops_[idx]->loop()->updateChannel(conn->channel.get());   // 注册进【子】epoll
+
+    st.conns[fd] = std::move(conn);   // 注意：raw 在 move 之前就取好了
+    const size_t total = connCount_.fetch_add(1) + 1;
+    logLine("[+] 新连接 fd=%d → 子 loop #%zu（当前共 %zu 个连接）", fd, idx, total);
+}
+
+// 把任务投递到指定子 loop 的线程。
+// 返回 false 说明该 loop 已停止（runInLoop 明确拒绝），调用者应自行处理。
+void ChatServer::runInSub(size_t idx, std::function<void()> fn)
+{
+    if (idx >= subLoops_.size())
+        return;
+    if (!subLoops_[idx]->loop()->runInLoop(std::move(fn))) {
+        // loop 已停：多半是正在关闭。这里只记日志，不重试 ——
+        // 关闭流程里再往队列塞任务只会制造"永远跑不到的僵尸任务"。
+        logLine("[!] 子 loop #%zu 已停止，任务被拒绝", idx);
+    }
+}
+
+// 遍历所有子 loop，把 fn 投递到每个 loop 的线程。
+// fn 的参数是 loop 下标，方便在任务里访问对应的 SubState。
+void ChatServer::forEachSub(const std::function<void(size_t)>& fn)
+{
+    for (size_t i = 0; i < subLoops_.size(); ++i)
+        runInSub(i, [fn, i] { fn(i); });
+}
+
+// 当前线程属于哪个子 loop？找不到返回 kSubLoopCount（表示"不在任何子 loop 里"）。
+// 用途：回调内部判断"我是不是已经在目标 loop 的线程里了"，避免重复投递。
+size_t ChatServer::currentSubIndex() const
+{
+    const auto me = std::this_thread::get_id();
+    for (size_t i = 0; i < subLoops_.size(); ++i) {
+        if (subLoops_[i]->id() == me)
+            return i;
+    }
+    return kSubLoopCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,31 +592,19 @@ void ChatServer::onAccept()
             break;
         }
 
+        // ⚠️ accept 出来的 fd 不会继承 listenFd_ 的 O_NONBLOCK（accept(2) man page 明写）。
+        // 漏了这步，子 loop 里的 recv 会阻塞，整条线程被一个慢客户端冻住。
         setNonBlocking(fd);
 
-        auto conn      = std::make_unique<Connection>();
-        conn->fd       = fd;
-        conn->lastActive = time(nullptr);
-        conn->channel  = std::make_unique<Channel>(fd);
+        // ---- 轮询分配给某个子 loop ----
+        const size_t idx = nextLoop_.fetch_add(1, std::memory_order_relaxed) % kSubLoopCount;
 
-        // 回调里只捕获裸指针 Connection*。
-        // 安全性靠两条保证：
-        //   ① 连接对象不会当场销毁（挂到 pendingReap_，等安全点再销毁）
-        //   ② 每个回调开头检查 closing，已在关闭流程中就立刻返回
-        Connection* raw = conn.get();
-        conn->channel->setReadCallback ([this, raw] { onRead(raw); });
-        conn->channel->setWriteCallback([this, raw] { onWrite(raw); });   // EPOLLOUT：续发半写
-        conn->channel->setErrorCallback([this, raw] { closeConn(raw, "EPOLLERR"); });
-        conn->channel->setCloseCallback([this, raw] { closeConn(raw, "EPOLLHUP"); });
-
-        conn->channel->enableReading();
-        loop_.updateChannel(conn->channel.get());   // 注册进 epoll（第一次是 ADD）
-
-        conns_[fd] = std::move(conn);   // 注意：raw 在 move 之前就取好了
-        logLine("[+] 新连接 fd=%d（当前 %zu 个连接）", fd, conns_.size());
+        // ⚠️ 关键：连接对象必须在【目标 loop 的线程】里创建。
+        //    因为 Channel 的回调、生命周期管理、conns 表都在那个线程的上下文里。
+        //    在主线程创建再传过去，后面读数据时就是数据竞争（B3 实验用 TSan 验证过）。
+        runInSub(idx, [this, fd, idx] { adoptConnection(fd, idx); });
     }
 }
-
 // ---------------------------------------------------------------------------
 // 【第 2 课的核心】读到数据 → 循环切出"完整帧"
 //
@@ -588,19 +769,26 @@ void ChatServer::handleLogin(Connection* conn, const std::string& payload)
         sendError(conn, "昵称不合法（1~32 字节，不能含换行等控制字符）", /*fatal=*/false);
         return;
     }
-    if (nameIndex_.count(payload) > 0) {
-        sendError(conn, "昵称「" + payload + "」已被占用，请换一个", /*fatal=*/false);
-        return;
+
+    // ⚠️ "查重 + 登记" 必须原子完成，否则两个客户端同时登录同一个昵称
+    //    可能都查到"没人用"，然后都登记成功 —— 后一个会覆盖前一个。
+    //    所以这里用【写锁】包住整个临界区，而不是先查再写。
+    {
+        std::unique_lock<std::shared_mutex> lk(nameMutex_);
+        if (nameIndex_.count(payload) > 0) {
+            lk.unlock();      // 先放锁再发消息（sendFrame 可能触发 IO，不该持锁）
+            sendError(conn, "昵称「" + payload + "」已被占用，请换一个", /*fatal=*/false);
+            return;
+        }
+        conn->nick = payload;
+        nameIndex_[payload] = { conn->owner, conn->fd };   // 值变成 (loop 下标, fd)
     }
 
-    conn->nick          = payload;
-    nameIndex_[payload] = conn->fd;      // 第二张表：昵称 → fd
-
-    logLine("[+] 用户上线：%s（fd=%d，当前在线 %zu 人）",
-            conn->nick.c_str(), conn->fd, nameIndex_.size());
+    logLine("[+] 用户上线：%s（fd=%d，loop #%zu，当前在线 %zu 人）",
+            conn->nick.c_str(), conn->fd, conn->owner, nameIndex_.size());
 
     sendFrame(conn, proto::Welcome, conn->nick);   // 只回给对方：登录成功
-    usersDirty_ = true;                            // 名单变了 → 安全点统一广播（含新人自己）
+    subStates_[conn->owner]->usersDirty = true;    // 名单变了 → 本 loop 安全点触发广播
 }
 
 // ---------------------------------------------------------------------------
@@ -640,22 +828,37 @@ void ChatServer::handleSay(Connection* conn, const std::string& payload)
         const std::string target = payload.substr(1, sep - 1);
         const std::string body   = payload.substr(sep + 1);
 
-        auto it = nameIndex_.find(target);
-        if (it == nameIndex_.end()) {
-            // 可恢复错误：对方不在线，只提示发送者，不踢人
-            sendError(conn, "对方不在线：" + target, /*fatal=*/false);
-            return;
+        // ⚠️ 私聊是跨 loop 的：目标可能在别的子 loop 上。
+        //    第一步：在全局索引里查它属于哪条 loop（读锁）
+        size_t targetOwner = 0;
+        int    targetFd    = -1;
+        {
+            std::shared_lock<std::shared_mutex> lk(nameMutex_);
+            auto it = nameIndex_.find(target);
+            if (it == nameIndex_.end()) {
+                lk.unlock();
+                // 可恢复错误：对方不在线，只提示发送者，不踢人
+                sendError(conn, "对方不在线：" + target, /*fatal=*/false);
+                return;
+            }
+            targetOwner = it->second.first;
+            targetFd    = it->second.second;
         }
 
-        auto cit = conns_.find(it->second);
-        if (cit == conns_.end() || cit->second->closing) {
-            // 理论上到不了（关闭时两张表是同步清理的）；防一手，真到了也当"不在线"
-            sendError(conn, "对方不在线：" + target, /*fatal=*/false);
-            return;
-        }
+        // 第二步：把"发送"投递到目标所属的 loop 线程里执行
+        const std::string from = conn->nick;
+        logLine("[>] %s 私聊 → %s（正文 %zu 字节，跨 loop #%zu→#%zu）",
+                from.c_str(), target.c_str(), body.size(), conn->owner, targetOwner);
 
-        logLine("[>] %s 私聊 → %s（正文 %zu 字节）", conn->nick.c_str(), target.c_str(), body.size());
-        sendFrame(cit->second.get(), proto::Chat, buildChatPayload('D', conn->nick, body));
+        runInSub(targetOwner, [this, targetOwner, targetFd, from, body] {
+            SubState& st = *subStates_[targetOwner];
+            auto cit = st.conns.find(targetFd);
+            if (cit == st.conns.end() || cit->second->closing) {
+                // 理论上到不了（关闭时两张表是同步清理的）；防一手，真到了也当"不在线"
+                return;
+            }
+            sendFrame(cit->second.get(), proto::Chat, buildChatPayload('D', from, body));
+        });
         return;
     }
 
@@ -676,10 +879,13 @@ void ChatServer::handleBye(Connection* conn)
 // 取一份"已登录连接"的快照（裸指针列表）。
 // 为什么先拷贝？sendFrame 失败会顺手 closeConn → erase conns_，
 // 边遍历 unordered_map 边改它是 UB。先快照、再操作，最稳。
-std::vector<Connection*> ChatServer::loggedConns() const
+// 已登录连接的快照。⚠️ 必须只在【连接所属 loop 的线程】里调用。
+// 语义变了：只返回"本 loop 的"连接，不是全局的。
+// 全局广播由 broadcastUsers() 遍历所有 loop 完成。
+std::vector<Connection*> ChatServer::loggedConnsOf(SubState& st) const
 {
     std::vector<Connection*> v;
-    for (const auto& [fd, conn] : conns_) {
+    for (auto& [fd, conn] : st.conns) {
         if (!conn->closing && !conn->nick.empty())
             v.push_back(conn.get());
     }
@@ -690,10 +896,16 @@ std::vector<Connection*> ChatServer::loggedConns() const
 // 排个序再拼，让每次推送的顺序稳定（unordered_map 的遍历顺序不保证）。
 std::string ChatServer::onlineNicks() const
 {
+    // 直接用全局 nameIndex_：它就是"所有在线昵称"的权威来源，
+    // 而且不需要遍历各个 loop 的连接表（那要跨线程）。
+    //
+    // 读锁：多个子 loop 可能同时要名单，读-读可以并行。
     std::vector<std::string> nicks;
-    for (const auto& [fd, conn] : conns_) {
-        if (!conn->closing && !conn->nick.empty())
-            nicks.push_back(conn->nick);
+    {
+        std::shared_lock<std::shared_mutex> lk(nameMutex_);
+        nicks.reserve(nameIndex_.size());
+        for (const auto& [nick, loc] : nameIndex_)
+            nicks.push_back(nick);
     }
     std::sort(nicks.begin(), nicks.end());
 
@@ -709,22 +921,43 @@ std::string ChatServer::onlineNicks() const
 // 本函数只在安全点（reapPending）被调用一次 —— 见 usersDirty_ 的说明。
 void ChatServer::broadcastUsers()
 {
-    const auto targets     = loggedConns();
+    // 名单内容先算好（只读一次 nameIndex_），再投递到各个 loop 去发。
+    // 每个 loop 只给"自己负责的已登录连接"发，天然分片。
     const std::string list = onlineNicks();
-    logLine("[>] 广播 Users 名单（%zu 人在线）", targets.size());
-    for (Connection* c : targets)
-        sendFrame(c, proto::Users, list);
+    const size_t total = connCount_.load();
+    logLine("[>] 广播 Users 名单（%zu 人在线，%zu 个连接）", total, total);
+
+    forEachSub([this, list](size_t idx) {
+        SubState& st = *subStates_[idx];
+        for (Connection* c : loggedConnsOf(st))
+            sendFrame(c, proto::Users, list);
+    });
 }
 
 // 群发：把发送者的原话包成 Chat 帧，发给除他以外的所有在线用户。
 // （发送者自己不回显：客户端在本地就把消息显示出来了，再回一份就重了）
 void ChatServer::broadcastChat(Connection* sender, const std::string& body)
 {
-    const std::string payload = buildChatPayload('B', sender->nick, body);
-    for (Connection* c : loggedConns()) {
-        if (c == sender) continue;
-        sendFrame(c, proto::Chat, payload);
-    }
+    // ⚠️ 这里有个跨越 loop 的问题：
+    //    sender 属于某个 loop，但接收者分散在所有 loop。
+    //    sendFrame 必须在接收者所属的 loop 线程里执行。
+    //
+    // 做法：把"发给哪个 loop 的所有已登录连接"包装成任务投递过去。
+    // 注意 sender 的昵称要先拷出来 —— 它可能在投递期间被关闭（nick 被清空）。
+    const std::string from = sender->nick;
+    const std::string payload = buildChatPayload('B', from, body);
+    const size_t senderLoop = sender->owner;
+    Connection* senderRaw = sender;
+
+    forEachSub([this, payload, senderLoop, senderRaw](size_t idx) {
+        SubState& st = *subStates_[idx];
+        for (Connection* c : loggedConnsOf(st)) {
+            if (c == senderRaw && idx == senderLoop) continue;   // 发送者自己不回显
+            // 用昵称二次确认：投递期间这条连接可能已被回收并复用了 fd/指针。
+            // closing 检查在 sendFrame 内部已经做了。
+            sendFrame(c, proto::Chat, payload);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -749,38 +982,41 @@ void ChatServer::closeConn(Connection* conn, const std::string& reason)
     // 第 3 课：同步清理"业务世界的地址"。
     // 忘了这一步 = 幽灵用户：人已经走了，名单里还挂着他的名字，
     // 别人私聊他还能"发出去"（发向一个已关闭的 fd），名单也越列越长。
+    //
+    // ⚠️ 主从版：nameIndex_ 是跨 loop 共享的，必须加写锁。
+    //    用 unique_lock（独占），因为可能是 erase。
     if (!conn->nick.empty()) {
-        nameIndex_.erase(conn->nick);
+        {
+            std::unique_lock<std::shared_mutex> lk(nameMutex_);
+            nameIndex_.erase(conn->nick);
+        }
         conn->nick.clear();
-        usersDirty_ = true;     // 名单少了人 → 安全点广播新名单
+        subStates_[conn->owner]->usersDirty = true;   // 名单少了人 → 安全点广播
     }
 
-    loop_.removeChannel(conn->channel.get());   // 从 epoll 摘掉
-    ::close(conn->fd);                          // 关 fd
+    EventLoop* sub = subLoops_[conn->owner]->loop();
+    sub->removeChannel(conn->channel.get());   // 从【子】epoll 摘掉
+    ::close(conn->fd);                         // 关 fd
+    connCount_.fetch_sub(1);
 
-    auto it = conns_.find(conn->fd);
-    if (it != conns_.end()) {
-        pendingReap_.push_back(std::move(it->second));   // 所有权移走，对象先不死
-        conns_.erase(it);
+    // 延迟回收：此刻可能正在 conn 自己的回调栈里
+    SubState& st = *subStates_[conn->owner];
+    auto it = st.conns.find(conn->fd);
+    if (it != st.conns.end()) {
+        st.pendingReap.push_back(std::move(it->second));   // 所有权移走，对象先不死
+        st.conns.erase(it);
     }
 }
 
 // 安全点到了：本轮所有回调都已返回，可以放心销毁
 void ChatServer::reapPending()
 {
-    if (!pendingReap_.empty()) {
-        logLine("[reap] 安全回收 %zu 个连接对象（此刻所有回调均已返回）", pendingReap_.size());
-        pendingReap_.clear();    // unique_ptr 析构 → Channel 析构
-    }
-
-    // 名单在本轮变过？统一在这里广播一次。
-    // 为什么不"谁登录/下线就谁立刻广播"？因为广播里 sendFrame 失败会 closeConn →
-    // 又触发广播……层层嵌套（重入），很容易写出难查的 bug。
-    // 延迟到安全点、一次播完：逻辑最简单，也最安全。
-    if (usersDirty_) {
-        usersDirty_ = false;
-        broadcastUsers();
-    }
+    // 主 loop 自己不持有任何连接，所以这里只需要处理"主 loop 触发的名单广播"。
+    // 连接回收已经分散到各子 loop 的 postDispatch 里了。
+    //
+    // 为什么保留这个函数？因为主 loop 的 onAccept 可能因为刚分配完连接
+    // 而需要广播 —— 目前 accept 不改变名单（登录才改），所以这里是空的。
+    // 留着是为了保持结构对称，将来在主 loop 上加逻辑时有地方放。
 }
 
 // ---------------------------------------------------------------------------
@@ -871,15 +1107,25 @@ void ChatServer::onWrite(Connection* conn)
 // ---------------------------------------------------------------------------
 void ChatServer::onIdleTick()
 {
+    // 定时器在主 loop 上。但连接分散在各个子 loop 里，
+    // 所以要把"扫一遍自己负责的连接"投递到每个子 loop 执行。
+    //
+    // 为什么不在主线程直接遍历？因为 conns 是子 loop 私有的，
+    // 主线程读它 = 数据竞争（子线程可能正在 insert/erase）。
     const time_t now = time(nullptr);
 
-    std::vector<Connection*> dead;
-    for (auto& [fd, conn] : conns_) {
-        if (now - conn->lastActive > kIdleTimeoutSec)
-            dead.push_back(conn.get());
-    }
-    for (Connection* c : dead)
-        closeConn(c, "空闲超时");
+    forEachSub([this, now](size_t idx) {
+        SubState& st = *subStates_[idx];
+
+        // 先收集再处理：closeConn 会 erase st.conns，边遍历边改是 UB
+        std::vector<Connection*> dead;
+        for (auto& [fd, conn] : st.conns) {
+            if (now - conn->lastActive > kIdleTimeoutSec)
+                dead.push_back(conn.get());
+        }
+        for (Connection* c : dead)
+            closeConn(c, "空闲超时");
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -892,14 +1138,19 @@ void ChatServer::onWakeup()
     ssize_t n = ::read(g_wakeupFd, &one, sizeof(one));
     (void)n;
 
-    logLine("收到 SIGINT，正在优雅关闭（在线 %zu 个连接）...", conns_.size());
+    logLine("收到 SIGINT，正在优雅关闭（在线 %zu 个连接）...", connCount_.load());
 
-    std::vector<Connection*> all;
-    for (auto& [fd, conn] : conns_)
-        all.push_back(conn.get());
-
-    for (Connection* c : all)
-        sendFrame(c, proto::Error, "服务器正在关闭");
+    // 通知所有客户端：服务器要关了。
+    // 同样要投递到各子 loop —— sendFrame 会改 conn->out 和 Channel::events_，
+    // 只能在连接所属的线程里做。
+    forEachSub([this](size_t idx) {
+        SubState& st = *subStates_[idx];
+        std::vector<Connection*> all;
+        for (auto& [fd, conn] : st.conns)
+            all.push_back(conn.get());
+        for (Connection* c : all)
+            sendFrame(c, proto::Error, "服务器正在关闭");
+    });
 
     loop_.quit();
 }

@@ -29,6 +29,7 @@ class EventLoop{
         wakeupCh_->setReadCallback([this]{handleWakeup();});
         wakeupCh_->enableReading();
         poller_.updateChannel(wakeupCh_.get());
+        running_.store(true);      // 在这里初始化：允许"先 quit() 再 loop()"
     }
     EventLoop(const EventLoop&) = delete;              // 事件循环不可复制
     EventLoop& operator=(const EventLoop&) = delete;
@@ -58,8 +59,17 @@ class EventLoop{
         postDispatch_=move(f);
     }
     // 主循环：反复"等事件 → 分发到 Channel 的回调"
+    //
+    // ⚠️ 这里【不再】写 running_ = true。
+    //    原来那行会覆盖 quit() 提前设置的 false，导致"先 quit 再 loop"永远卡死
+    //    （tests/a3_shutdown_semantics.cpp 用例1 就是抓这个）。
+    //    现在 running_ 在构造函数里初始化为 true，loop() 只读不写。
+    //
+    // ⚠️ 退出前补一次 doPendingFunctors()。
+    //    正常路径里每轮循环末尾都会跑，但 quit() 可能发生在任务入队之后、
+    //    下一轮循环之前。不补这一下，quit 前投递的任务会被静默丢弃
+    //    （tests/a3_shutdown_semantics.cpp 用例2）。
     void loop(){
-        running_ = true;
         owner_.store(std::this_thread::get_id());
 
         while (running_) {
@@ -69,21 +79,31 @@ class EventLoop{
             doPendingFunctors();
             if (postDispatch_) postDispatch_();
         }
+        // 收尾：把 quit() 之后残留的任务跑完，再退出
+        doPendingFunctors();
     }
     void quit(){
         running_ = false;
         wakeup();
     }
-    void runInLoop(Functor f){
+    // 投递一个任务到 loop 线程执行。
+    // 返回 false 表示【明确拒绝】：loop 已停止，任务不会执行。
+    // 调用者必须检查返回值 —— 静默丢弃是"关闭前最后一次发送"丢失的根源
+    // （见 tests/a3_shutdown_semantics.cpp 用例2）。
+    bool runInLoop(Functor f){
         if (isInLoopThread()) {
+            if (!f) return false;
             f();
-            return;
+            return true;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_.load())
+                return false;          // 已停：拒绝，不留下永远跑不到的僵尸任务
             pending_.push_back(std::move(f));
         }
         wakeup();
+        return true;
     }
     bool isInLoopThread() const {
         return owner_.load() == std::this_thread::get_id();

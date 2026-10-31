@@ -99,17 +99,26 @@ void case2_enqueueAfterQuit()
     t.join();                         // 等线程真正退出
 
     std::atomic<int> ran{0};
-    for (int i = 0; i < 100; ++i)
-        loop.runInLoop([&] { ++ran; });
+    int rejected = 0;
+    for (int i = 0; i < 100; ++i) {
+        // runInLoop 现在返回 bool：false = loop 已停，明确拒绝
+        if (!loop.runInLoop([&] { ++ran; }))
+            ++rejected;
+    }
 
     std::this_thread::sleep_for(200ms);
 
-    // 现在的 runInLoop 返回 void，无法感知"被拒绝"。
-    // 所以判定标准是：要么执行了（100），要么明确拒绝。二者都没有才算失败。
+    // 判定标准（二选一都算通过）：
+    //   a) 任务被执行了（100 个全跑）
+    //   b) 被明确拒绝（rejected == 100），调用者能感知
+    // 唯一不能接受的是"既不执行也不拒绝" —— 静默丢失。
     const int n = ran.load();
-    char detail[128];
-    snprintf(detail, sizeof(detail), "实际执行 %d / 100（0 表示静默丢失）", n);
-    report("用例2", n == 100, detail);
+    const bool pass = (n == 100) || (n == 0 && rejected == 100);
+    char detail[192];
+    snprintf(detail, sizeof(detail),
+             "执行 %d / 100，明确拒绝 %d（静默丢失=%s）",
+             n, rejected, (n == 0 && rejected != 100) ? "是" : "否");
+    report("用例2", pass, detail);
 }
 
 // ---------------------------------------------------------------------------

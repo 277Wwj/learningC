@@ -1,6 +1,7 @@
 #pragma once
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <errno.h>
 #include <vector>
 #include <unordered_map>
 #include <utility>
@@ -51,6 +52,12 @@ class Poller{
         struct epoll_event events[1024];
         int n=epoll_wait(epfd_,events,1024,timeoutMs);
         if(n<0){
+            // EINTR：被信号打断（比如 Ctrl+C、SIGCHLD）。这不是错误，
+            // 直接返回空列表，让调用方继续下一轮循环即可。
+            // 主从版里主 loop 收到 SIGINT 时必走这条路径，若当错误打印，
+            // 日志里会出现吓人的 "epoll_wait 失败: Interrupted system call"。
+            if (errno == EINTR)
+                return ready;
             perror("epoll_wait 失败");
             return ready;
         }
