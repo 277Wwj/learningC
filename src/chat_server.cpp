@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <functional>
 #include <future>
@@ -112,7 +113,25 @@ const char* typeName(uint32_t t)
 } // namespace proto
 
 // 运行参数
-static constexpr size_t kSubLoopCount = 4;   // 子 Reactor 数量（建议 = CPU 核数）
+
+// 子 Reactor 数量。压测时可用环境变量覆盖：
+//   SUB_LOOPS=1 ./chat_server    （退化成单 Reactor，用于对比）
+//   SUB_LOOPS=8 ./chat_server
+//
+// 为什么要有这个开关？因为"开几个子 loop 最快"没有标准答案：
+//   · 太少：CPU 用不满
+//   · 太多：线程切换 + 锁竞争反而变慢
+//   · 经验值：等于物理核数，但要实测
+static const size_t kSubLoopCount = [] {
+    if (const char* e = ::getenv("SUB_LOOPS")) {
+        const int n = ::atoi(e);
+        if (n >= 1 && n <= 64)
+            return static_cast<size_t>(n);
+        fprintf(stderr, "[!] SUB_LOOPS=%s 非法（允许 1~64），回退到默认\n", e);
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    return static_cast<size_t>(hw ? hw : 4);
+}();
 static constexpr int kHousekeepSec   = 5;    // 定时器周期：多久扫一遍空闲连接
 static constexpr int kIdleTimeoutSec = 65;  // 多久没收到任何数据就踢掉。20*3+5;
                                              // 更"正统"的做法是协议层心跳（Ping/Pong），
@@ -129,10 +148,21 @@ void setNonBlocking(int fd)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// 逐条日志开关。压测时设 CHAT_LOG=0 关掉：
+// 每条消息都格式化一次 stderr（write 系统调用），吞吐会被日志 I/O 卡住，
+// 测出来的是 fprintf 的速度，不是 Reactor 的速度。
+static const bool kLogEnabled = [] {
+    const char* e = ::getenv("CHAT_LOG");
+    return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+}();
+
 // 带时间戳的日志，输出到 stderr。
 // 注意：这只是"学习阶段"的简单日志，正式版应该换成异步日志（你的 simpleLogger.hpp）。
 void logLine(const char* fmt, ...)
 {
+    if (!kLogEnabled)
+        return;
+
     char ts[32];
     time_t now = time(nullptr);
     struct tm tmv{};
